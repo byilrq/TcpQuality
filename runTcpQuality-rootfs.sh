@@ -16,9 +16,15 @@ ALLOW_SPEEDTEST=0
 ROOTFS_URL="${TCPQUALITY_ROOTFS_URL:-}"
 ROOTFS_SHA256="${TCPQUALITY_ROOTFS_SHA256:-}"
 DEBIAN_SUITE="${TCPQUALITY_DEBIAN_SUITE:-bookworm}"
+ROOTFS_RELEASE_TAG="${TCPQUALITY_ROOTFS_RELEASE_TAG:-v1.latest}"
+ROOTFS_SOURCE="${TCPQUALITY_ROOTFS_SOURCE:-}"
+ROOTFS_SOURCE_ORDER="${TCPQUALITY_ROOTFS_SOURCE_ORDER:-github ibsgss}"
+ROOTFS_GITHUB_REPOSITORY="${TCPQUALITY_ROOTFS_GITHUB_REPOSITORY:-ibsgss/TcpQuality}"
+ROOTFS_IBSGSS_BASE="${TCPQUALITY_ROOTFS_IBSGSS_BASE:-https://tcpquality.ibsgss.uk/rootfs/releases}"
 OUTPUT_DIR="${TCPQUALITY_OUTPUT_DIR:-/tmp}"
 GUEST_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 NEXTTRACE_RELEASE_API=https://api.github.com/repos/nxtrace/NTrace-core/releases/latest
+NEXTTRACE_DOWNLOAD_TIMEOUT="${TCPQUALITY_NEXTTRACE_DOWNLOAD_TIMEOUT:-600}"
 DEBUG_MODE=0
 MIN_ROOTFS_FREE_KB=$((700 * 1024))
 
@@ -34,6 +40,7 @@ usage() {
   --rootfs DIR            使用已有 rootfs，不下载、不删除
   --url URL               使用自定义 rootfs tar(.gz/.xz/.zst)
   --sha256 HEX            校验自定义 rootfs 下载文件
+  环境变量 TCPQUALITY_ROOTFS_SOURCE=github|ibsgss|docker 可强制下载源
   --output DIR            保存 CSV/调试压缩包，默认宿主机 /tmp
   --keep                  保留本次创建的临时 rootfs，便于调试
   --allow-speedtest       允许北京三段限速测速修改宿主 qdisc/ifb（高风险，默认禁止）
@@ -46,6 +53,7 @@ usage() {
 
 注意:
   --rootfs 指定的已有 rootfs 会安装依赖并更新 resolv.conf，不是只读使用。
+  Debian 默认按入口优先选择 GitHub Release 或 ibsgss 镜像，校验失败后自动回退。
 EOF
 }
 
@@ -88,7 +96,7 @@ answer_is_no() {
 }
 
 configure_interactive_args() {
-  local answer run_route=0 run_edu=0 run_intl=0 run_speedtest=0
+  local answer run_route=0 run_edu=0 run_intl=0 run_speedtest=0 upload_rank=1
   local -a selected_args=()
 
   print_interactive_intro
@@ -111,14 +119,16 @@ configure_interactive_args() {
     ALLOW_SPEEDTEST=1
   fi
 
+  answer=$(prompt_answer "上传并参与速度排名？（回车默认 'y'）[y/n]：" "y")
+  answer_is_no "$answer" && upload_rank=0
+
   if [ "$run_route" -eq 0 ]; then
     if [ "$run_edu" -eq 0 ] && [ "$run_intl" -eq 0 ] && [ "$run_speedtest" -eq 0 ]; then
       die "未选择任何测试项目"
     fi
-    if [ "$run_edu" -eq 1 ] && [ "$run_intl" -eq 1 ]; then
-      die "教育网回程与国际互联单独运行时请分两次执行，或启用三网回程后组合运行"
-    fi
   fi
+
+  INTERACTIVE_INCLUDE_DEFAULT_ROUTE="$run_route"
 
   [ "$run_edu" -eq 1 ] && selected_args+=("--cernet")
   [ "$run_intl" -eq 1 ] && selected_args+=("--intl")
@@ -137,6 +147,8 @@ configure_interactive_args() {
      [ "$run_intl" -eq 1 ] && [ "$run_speedtest" -eq 1 ]; then
     selected_args=("--all")
   fi
+
+  [ "$upload_rank" -eq 0 ] && selected_args+=("--no-rank-upload")
 
   set -- "${selected_args[@]}"
   INTERACTIVE_ARGS=("$@")
@@ -448,7 +460,9 @@ download_nexttrace_guest() {
   fi
 
   binary="$RUNTIME_DIR/$asset_name"
-  curl -fL --retry 3 --connect-timeout 15 --max-time 300 "$url" -o "$binary" ||
+  curl -fL --retry 3 --retry-all-errors --continue-at - \
+    --connect-timeout 15 --max-time "$NEXTTRACE_DOWNLOAD_TIMEOUT" \
+    "$url" -o "$binary" ||
     return 1
   if [ -n "$digest" ]; then
     verify_sha256 "$digest" "$binary" || return 1
@@ -487,6 +501,104 @@ download_extract() {
     *) die "无法识别 rootfs 压缩格式: $archive" ;;
   esac
   rm -f -- "$archive"
+}
+
+rootfs_source_base() {
+  case "$1" in
+    github)
+      printf 'https://github.com/%s/releases/download/%s\n' "$ROOTFS_GITHUB_REPOSITORY" "$ROOTFS_RELEASE_TAG"
+      ;;
+    ibsgss)
+      printf '%s/%s\n' "${ROOTFS_IBSGSS_BASE%/}" "$ROOTFS_RELEASE_TAG"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+parse_rootfs_manifest() {
+  local manifest="$1" arch="$2"
+  awk -v wanted="$arch" '
+    $0 ~ ("\"" wanted "\"[[:space:]]*:") { inside=1; next }
+    inside && /"file"[[:space:]]*:/ {
+      line=$0; sub(/^.*"file"[[:space:]]*:[[:space:]]*"/, "", line); sub(/".*$/, "", line); file=line
+    }
+    inside && /"sha256"[[:space:]]*:/ {
+      line=$0; sub(/^.*"sha256"[[:space:]]*:[[:space:]]*"/, "", line); sub(/".*$/, "", line); sha=line
+    }
+    inside && /"size"[[:space:]]*:/ {
+      line=$0; sub(/^.*"size"[[:space:]]*:[[:space:]]*/, "", line); sub(/[^0-9].*$/, "", line); size=line
+    }
+    inside && /^([[:space:]]*)}/ {
+      if (file != "" && length(sha) == 64 && sha !~ /[^0-9a-fA-F]/ && size ~ /^[0-9]+$/) print file "|" tolower(sha) "|" size
+      exit
+    }
+  ' "$manifest"
+}
+
+download_prebuilt_debian_from() {
+  local source="$1" base manifest archive metadata file checksum expected_size actual_size
+  base=$(rootfs_source_base "$source") || return 1
+  manifest="$TEMP_ROOT_PARENT/rootfs-manifest-${source}.json"
+  archive="$TEMP_ROOT_PARENT/debian-rootfs-${source}.tar.gz"
+  echo "[i] 尝试 ${source} 预构建 rootfs: ${ROOTFS_RELEASE_TAG}"
+  curl -fsSL --retry 2 --connect-timeout 10 --max-time 45 \
+    "$base/rootfs-manifest.json" -o "$manifest" || return 1
+  metadata=$(parse_rootfs_manifest "$manifest" "$DEBIAN_ARCH") || return 1
+  [ -n "$metadata" ] || return 1
+  IFS='|' read -r file checksum expected_size <<< "$metadata"
+  case "$file" in
+    tcpquality-rootfs-*.tar.gz) ;;
+    *) return 1 ;;
+  esac
+  echo "[i] 下载 rootfs: $base/$file"
+  curl -fL --retry 3 --connect-timeout 15 --max-time 600 \
+    "$base/$file" -o "$archive" || return 1
+  actual_size=$(wc -c < "$archive" | tr -d ' ')
+  if [ "$actual_size" != "$expected_size" ]; then
+    echo "[!] ${source} rootfs 大小校验失败: expected=$expected_size actual=$actual_size" >&2
+    rm -f -- "$archive"
+    return 1
+  fi
+  if ! verify_sha256 "$checksum" "$archive"; then
+    echo "[!] ${source} rootfs SHA256 校验失败" >&2
+    rm -f -- "$archive"
+    return 1
+  fi
+  rm -rf -- "$ROOTFS_DIR"
+  mkdir -p "$ROOTFS_DIR"
+  if ! tar -xzf "$archive" -C "$ROOTFS_DIR"; then
+    rm -rf -- "$ROOTFS_DIR"
+    mkdir -p "$ROOTFS_DIR"
+    return 1
+  fi
+  rm -f -- "$archive"
+  [ -r "$ROOTFS_DIR/etc/os-release" ] || return 1
+  echo "[√] 已使用 ${source} 预构建 rootfs"
+}
+
+download_prebuilt_debian() {
+  local source order="$ROOTFS_SOURCE_ORDER"
+  case "$ROOTFS_SOURCE" in
+    "") ;;
+    github|ibsgss) order="$ROOTFS_SOURCE" ;;
+    docker) return 1 ;;
+    *) die "TCPQUALITY_ROOTFS_SOURCE 只能是 github、ibsgss 或 docker" ;;
+  esac
+  case "$DEBIAN_ARCH" in
+    amd64|arm64) ;;
+    *) return 1 ;;
+  esac
+  for source in $order; do
+    case "$source" in
+      github|ibsgss)
+        if download_prebuilt_debian_from "$source"; then
+          return 0
+        fi
+        echo "[!] ${source} 预构建 rootfs 不可用，尝试下一来源" >&2
+        ;;
+    esac
+  done
+  return 1
 }
 
 build_alpine() {
@@ -575,6 +687,10 @@ build_debian() {
     download_extract "$ROOTFS_URL" "$archive" "$ROOTFS_SHA256"
     return
   fi
+  if download_prebuilt_debian; then
+    return
+  fi
+  echo "[!] 预构建 rootfs 下载失败，回退官方 Debian OCI" >&2
   if download_debian_oci; then
     return
   fi
@@ -756,9 +872,15 @@ mount_guest() {
 
 install_guest_deps() {
   if [ "$DISTRO" = debian ]; then
+    if [ -r "$ROOTFS_DIR/etc/tcpquality-rootfs-release" ] &&
+       env -i HOME=/root "PATH=$GUEST_PATH" TERM=dumb chroot "$ROOTFS_DIR" /bin/bash -c \
+         'for cmd in bash curl dig gawk ip iperf3 iptables jq ping nping sed ss tar traceroute; do command -v "$cmd" >/dev/null || exit 1; done'; then
+      echo "[√] 预构建 rootfs 依赖已就绪"
+      return 0
+    fi
     local apt_log="$GUEST_TMP_HOST/debian-rootfs-apt.log"
     if ! env -i HOME=/root "PATH=$GUEST_PATH" TERM=dumb chroot "$ROOTFS_DIR" /bin/bash -c \
-      'export DEBIAN_FRONTEND=noninteractive PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; apt-get update -qq && apt-get install -y -qq --no-install-recommends bash ca-certificates coreutils curl dnsutils findutils gawk grep iproute2 iputils-ping kmod nmap ncurses-bin sed tar traceroute tzdata && rm -rf /var/lib/apt/lists/*' \
+      'export DEBIAN_FRONTEND=noninteractive PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; apt-get update -qq && apt-get install -y -qq --no-install-recommends bash ca-certificates coreutils curl dnsutils findutils gawk grep iperf3 iproute2 iptables iputils-ping jq kmod nmap ncurses-bin sed tar traceroute tzdata && rm -rf /var/lib/apt/lists/*' \
       >"$apt_log" 2>&1; then
       echo "[X] Debian rootfs 依赖安装失败" >&2
       echo "[i] apt/dpkg 日志已保留: $apt_log" >&2
@@ -771,7 +893,7 @@ install_guest_deps() {
   else
     local apk_log="$GUEST_TMP_HOST/alpine-rootfs-apk.log"
     if ! env -i HOME=/root "PATH=$GUEST_PATH" TERM=dumb chroot "$ROOTFS_DIR" /bin/sh -c \
-      'export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; apk add --no-cache bash bind-tools ca-certificates coreutils curl findutils gawk grep iproute2 iputils kmod ncurses nmap-nping sed tar traceroute tzdata' \
+      'export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; apk add --no-cache bash bind-tools ca-certificates coreutils curl findutils gawk grep iperf3 iproute2 iptables iputils jq kmod ncurses nmap-nping sed tar traceroute tzdata' \
       >"$apk_log" 2>&1; then
       echo "[X] Alpine rootfs 依赖安装失败" >&2
       echo "[i] apk 日志已保留: $apk_log" >&2
@@ -785,10 +907,24 @@ install_guest_deps() {
 }
 
 prepare_guest_files() {
-  local nexttrace_path
+  local nexttrace_path arg
   mkdir -p "$ROOTFS_DIR/root" "$ROOTFS_DIR/usr/local/bin"
   cp "$TARGET_SCRIPT" "$ROOTFS_DIR/root/runTcpQuality.sh"
   chmod 0755 "$ROOTFS_DIR/root/runTcpQuality.sh"
+
+  for arg in "$@"; do
+    if [ "$arg" = "--only-speedtest" ]; then
+      echo "[i] 单线程测速无需 nexttrace-tiny，已跳过下载"
+      return 0
+    fi
+  done
+
+  if [ -x "$ROOTFS_DIR/usr/local/bin/nexttrace-tiny" ] &&
+     env -i HOME=/root "PATH=$GUEST_PATH" TERM=dumb \
+       chroot "$ROOTFS_DIR" /usr/local/bin/nexttrace-tiny -V >/dev/null 2>&1; then
+    echo "[√] 预构建 rootfs 已包含 nexttrace-tiny"
+    return 0
+  fi
 
   if download_nexttrace_guest; then
     return 0
@@ -816,22 +952,31 @@ case "$OUTPUT_DIR/" in
 esac
 mount_guest
 install_guest_deps || exit 1
-prepare_guest_files
+prepare_guest_files "$@"
 echo "[i] 进入临时 ${DISTRO} rootfs；退出后自动清理"
 if [ "$KEEP_ROOTFS" -eq 1 ]; then
   echo "[i] --keep 已启用，rootfs 保留于: $ROOTFS_DIR"
 fi
+
+guest_term="${TERM:-dumb}"
+case "$guest_term" in
+  xterm-ghostty) guest_term=xterm ;;
+  "") guest_term=dumb ;;
+esac
 
 guest_env=(
   HOME=/root
   "PATH=$GUEST_PATH"
   LANG=C.UTF-8
   LC_ALL=C.UTF-8
-  "TERM=${TERM:-dumb}"
+  "TERM=$guest_term"
   TCPQUALITY_INSIDE_ROOTFS=1
 )
+if [ "${INTERACTIVE_INCLUDE_DEFAULT_ROUTE:-0}" -eq 1 ]; then
+  guest_env+=(TCPQUALITY_INCLUDE_DEFAULT_ROUTE=1)
+fi
 for env_name in \
-  GET_NODES_URL TCPQUALITY_REPORT_API \
+  GET_NODES_URL TCPQUALITY_REPORT_API TCPQUALITY_RANK_SESSION_API \
   HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY \
   http_proxy https_proxy no_proxy all_proxy; do
   if [ "${!env_name+x}" = x ]; then

@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 #
-# TcpQuality 节点 TCP 丢包探测脚本
-# 用法: bash <(curl -sL https://raw.githubusercontent.com/ibsgss/TcpQuality/main/runTcpQuality.sh)
-#
-# 每节点发送 60 个裸 TCP SYN 包，无内核重传
-# TUI 风格实时展示省份/运营商丢包率
+# TcpQuality
 #
 
 set -e
@@ -27,7 +23,7 @@ bootstrap_nixos_environment() {
   for arg in "$@"; do
     case "$arg" in
       -h|--help) return 0 ;;
-      --all|--speedtest|--only-speedtest|--speedtest-staged|--only-speedtest-staged) need_speedtest=1 ;;
+      --all|--speedtest|--only-speedtest) need_speedtest=1 ;;
     esac
   done
 
@@ -56,13 +52,14 @@ bootstrap_nixos_environment() {
     nixpkgs#gnused
     nixpkgs#iproute2
     nixpkgs#iputils
-    nixpkgs#kmod
     nixpkgs#ncurses
     nixpkgs#nmap
+    nixpkgs#iperf3
+    nixpkgs#jq
     nixpkgs#traceroute
   )
   if [ "$need_speedtest" -eq 1 ]; then
-    # 分阶段测速已改用 tosutil，进入 Nix 环境后由脚本按需下载官方二进制。
+    # 单线程测速只依赖 curl，使用 --resolve 固定 TOS 目标 IP。
     :
   fi
 
@@ -113,6 +110,9 @@ IPV6_PUBLIC=""
 IPV4_WORK=0
 IPV6_WORK=0
 GET_NODES_URL="${GET_NODES_URL:-https://tcpquality.ibsgss.uk/getNodes}"
+GET_NODES_LAST_URL=""
+GET_NODES_LAST_ERROR=""
+GET_NODES_LAST_STATUS=""
 REMOTE_NODES_LOADED=0
 REMOTE_CDN4_NODES=()
 REMOTE_CDN6_NODES=()
@@ -234,6 +234,12 @@ check_traceroute() {
   check_command traceroute traceroute traceroute traceroute traceroute traceroute traceroute traceroute
 }
 
+check_iperf3() {
+  check_command iperf3 iperf3 iperf3 iperf3 iperf3 iperf3 iperf3 iperf3
+  check_command jq jq jq jq jq jq jq jq
+  check_command ss ss iproute2 iproute2 iproute2 iproute2 iproute2 iproute2
+}
+
 check_nexttrace() {
   if command -v nexttrace-tiny &>/dev/null; then
     return 0
@@ -252,7 +258,7 @@ require_raw_socket_privilege() {
 # ===================== 远端节点 =====================
 # 节点域名、真实 IP 与端口统一由 GET_NODES_URL 提供，脚本不再内置探测节点或备用节点。
 
-PACKETS=30
+PACKETS=25
 MAX_PACKETS=600
 COUNT_EXPLICIT=0
 PACKET_SIZES=(40 80 160 320 640 1200)
@@ -270,16 +276,21 @@ IPV6_NPING_PRECHECK_PACKETS=3
 IPV6_NPING_FORCE_L2=0
 TOTAL=0
 PARALLEL=16
+PARALLEL_EXPLICIT=0
 TEST_CERNET=0
 TEST_ALL=0
+INCLUDE_DEFAULT_ROUTE="${TCPQUALITY_INCLUDE_DEFAULT_ROUTE:-0}"
 UPLOAD_REPORT=1
+REPORT_UPLOAD_FORCED_OFF=0
 ONLY_IPV4=0
 ONLY_IPV6=0
 ONLY_LARGE=0
 ROUTE_MODE=0
 ROUTE_PROTOCOL="tcp"
 ROUTE_ACTIVE_PREFIX=""
-SELECTED_PROVINCES=""
+DOMESTIC_PROVINCE="上海"
+# 精简版固定只检测上海三网，避免默认全国节点探测带来的额外流量。
+SELECTED_PROVINCES="|${DOMESTIC_PROVINCE}|"
 DEBUG_MODE=0
 SPEEDTEST_ENABLED=0
 SPEEDTEST_ONLY=0
@@ -288,6 +299,15 @@ INTERNATIONAL_ONLY=0
 INTL_REQUESTED=0
 INTERNATIONAL_PROGRESS_TOTAL=0
 INTERNATIONAL_PACKETS=15
+INTERNATIONAL_HTTP_TIMEOUT=8
+INTERNATIONAL_MAX_IPS="${TCPQUALITY_INTERNATIONAL_MAX_IPS:-2}"
+if ! [[ "$INTERNATIONAL_MAX_IPS" =~ ^[1-9][0-9]*$ ]]; then
+  INTERNATIONAL_MAX_IPS=2
+fi
+INTERNATIONAL_IPERF_SECONDS="${TCPQUALITY_INTERNATIONAL_IPERF_SECONDS:-5}"
+INTERNATIONAL_IPERF_RATE="${TCPQUALITY_INTERNATIONAL_IPERF_RATE:-1M}"
+INTERNATIONAL_IPERF_CONNECT_TIMEOUT_MS="${TCPQUALITY_INTERNATIONAL_IPERF_CONNECT_TIMEOUT_MS:-5000}"
+INTERNATIONAL_IPERF_MAX_ATTEMPTS=10
 SPEEDTEST_STATE_FILE=""
 SPEEDTEST_PROGRESS_FILE=""
 SPEEDTEST_BACKGROUND=0
@@ -300,8 +320,16 @@ PROGRESS_LAST_STATE=""
 PROGRESS_LAST_TS=0
 PROGRESS_MIN_INTERVAL=1
 REPORT_API=${TCPQUALITY_REPORT_API:-https://tcpquality.ibsgss.uk/generate}
+ROUTE_ASN_API=${TCPQUALITY_ROUTE_ASN_API:-${REPORT_API%/generate}/route/asn?format=tsv}
+RANK_SESSION_API=${TCPQUALITY_RANK_SESSION_API:-${REPORT_API%/generate}/rank/session}
+RANK_SESSION_ID=""
+RANK_SESSION_TOKEN=""
+RANK_SESSION_STARTED_AT=""
+RANK_SESSION_EXPIRES_AT=""
+RANK_SESSION_IP4=""
 RESULT_DIR=$(mktemp -d)
 cleanup_result_dir() {
+  printf '%b' "${NC:-\033[0m}"
   if [ "${DEBUG_MODE:-0}" -eq 1 ]; then
     local archive="${RESULT_DIR}.tar.gz"
     if [ -d "$RESULT_DIR" ] && tar -C "$(dirname "$RESULT_DIR")" -czf "$archive" "$(basename "$RESULT_DIR")" 2>/dev/null; then
@@ -320,7 +348,11 @@ cleanup_result_dir() {
 trap cleanup_result_dir EXIT
 
 # ===================== 国际互联目标 =====================
-# 常用网站使用更接近日常访问/API 的入口；CDN 使用常见静态资源或边缘入口。
+# 网站格式：名称|域名|可选 HTTP 路径。
+# CDN 格式：名称|提供商|域名|可选静态资源路径。
+#
+# 这里优先使用可长期访问的静态资源入口；官网和临时 Demo 不作为 CDN 基准。
+# 路径非空时，TCP 探测成功后会额外做一次 HTTP HEAD；使用 --debug 时会保存状态/边缘信息。
 INTERNATIONAL_SITE_TARGETS=(
   'Adobe Assets|assets.adobe.com'
   'Amazon|www.amazon.com'
@@ -356,20 +388,34 @@ INTERNATIONAL_SITE_TARGETS=(
 )
 
 INTERNATIONAL_CDN_TARGETS=(
-  'Akamai Edge|www.akamai.com'
-  'AWS Static|d1.awsstatic.com'
-  'CacheFly|cachefly.cachefly.net'
-  'CDN77 Demo|1906714720.rsc.cdn77.org'
-  'Cloudflare CDNJS|cdnjs.cloudflare.com'
-  'Fastly Demo|http-me.fastly.dev'
-  'Google Fonts Static|fonts.gstatic.com'
-  'Google Hosted Libraries|ajax.googleapis.com'
-  'jsDelivr|cdn.jsdelivr.net'
-  'Microsoft Ajax CDN|ajax.aspnetcdn.com'
-  'QUANTIL Edge|www.quantil.com'
-  'Tencent EdgeOne|edgeone.ai'
-  'UNPKG|unpkg.com'
-  'Vercel Edge|vercel.com'
+  'Akamai Edge|Akamai|www.akamai.com|'
+  'AWS CloudFront|CloudFront|d1.awsstatic.com|'
+  'CacheFly|CacheFly|cachefly.cachefly.net|'
+  'Cloudflare CDNJS|Cloudflare|cdnjs.cloudflare.com|/ajax/libs/jquery/3.7.1/jquery.min.js'
+  'Fastly Test|Fastly|http-me.fastly.dev|'
+  'Google Hosted Libraries|Google|ajax.googleapis.com|/ajax/libs/jquery/3.7.1/jquery.min.js'
+  'jsDelivr Multi-CDN|jsDelivr|cdn.jsdelivr.net|/npm/jquery@3.7.1/dist/jquery.min.js'
+  'UNPKG Cloudflare|UNPKG|unpkg.com|/jquery@3.7.1/dist/jquery.min.js'
+)
+
+# Leaseweb speedtest 节点支持 iPerf3 TCP，端口范围为 5201-5210。
+# row_key 用于区分两行“美洲”，报告页面会按 row_key 分组并分别展示 IPv4/IPv6。
+# 目标格式：row_key|区域|节点|主机|IPv4 起始端口|可选 IPv6 起始端口|可选 IPv4 备用主机|可选 IPv4 备用起始端口|可选 IPv6 备用主机|可选 IPv6 备用起始端口。
+INTERNATIONAL_IPERF_TARGETS=(
+  'asia|亚洲|香港|speedtest.hkg12.hk.leaseweb.net|5201'
+  'asia|亚洲|日本|speedtest.tyo11.jp.leaseweb.net|5201'
+  'asia|亚洲|新加坡|speedtest.sin1.sg.leaseweb.net|5201'
+  'americas-us|美洲|美国西部-洛杉矶|speedtest.lax12.us.leaseweb.net|5201'
+  'americas-us|美洲|美国中部-达拉斯|speedtest.dal13.us.leaseweb.net|5201'
+  'americas-us|美洲|美国东部-芝加哥|speedtest.chi11.us.leaseweb.net|5201'
+  'americas-latam|美洲|加拿大-蒙特利尔|speedtest.mtl2.ca.leaseweb.net|5201'
+  # 巴西：Edgoo 节点优先；Leaseweb MIA-11 仅作为 IPv4 备用，IPv6 不设置备用。
+  'americas-latam|美洲|巴西-里约热内卢|speedtest.sao1.edgoo.net|9209|9208|speedtest.mia11.us.leaseweb.net|5201'
+  'europe|欧洲|德国-法兰克福|speedtest.fra1.de.leaseweb.net|5201'
+  'europe|欧洲|英国-伦敦|speedtest.lon1.uk.leaseweb.net|5201'
+  'europe|欧洲|荷兰-阿姆斯特丹|speedtest.ams1.nl.leaseweb.net|5201'
+  # 悉尼：LeaseWeb 为默认节点；OVH 仅作为 IPv6 备用节点。
+  'oceania|大洋洲|澳大利亚-悉尼|speedtest.syd12.au.leaseweb.net|5201||||syd.proof.ovh.net|5201'
 )
 
 # ===================== 省份筛选 =====================
@@ -416,10 +462,9 @@ province_from_code() {
 add_province_filter() {
   local province
   province=$(province_from_code "$1") || return 1
-  case "$SELECTED_PROVINCES" in
-    *"|$province|"*) ;;
-    *) SELECTED_PROVINCES="${SELECTED_PROVINCES}|${province}|" ;;
-  esac
+  # 上海精简版不允许通过参数重新加入其它省份。
+  [ "$province" = "$DOMESTIC_PROVINCE" ] || return 1
+  SELECTED_PROVINCES="|${DOMESTIC_PROVINCE}|"
 }
 
 province_selected() {
@@ -469,7 +514,7 @@ count_cernet2_nodes() {
 }
 
 node_scope() {
-  if [ "$TEST_ALL" -eq 1 ]; then
+  if [ "$TEST_ALL" -eq 1 ] || { [ "$INCLUDE_DEFAULT_ROUTE" -eq 1 ] && [ "$TEST_CERNET" -eq 1 ]; }; then
     echo "all"
   elif [ "$TEST_CERNET" -eq 1 ]; then
     echo "cernet"
@@ -484,16 +529,24 @@ node_scope() {
 
 load_remote_nodes() {
   local scope="${1:-$(node_scope)}"
-  local tmp line type family prov isp host ip port target backup_host backup_ip backup_port backup_target url sep
+  local tmp err line type family prov isp host ip port target backup_host backup_ip backup_port backup_target url sep curl_status
   command -v curl &>/dev/null || return 1
   tmp=$(mktemp)
+  err="${tmp}.err"
   sep="?"
   [[ "$GET_NODES_URL" == *"?"* ]] && sep="&"
   url="${GET_NODES_URL}${sep}format=tsv&scope=${scope}"
-  if ! curl -fsSL --connect-timeout 5 --max-time 30 "$url" > "$tmp" 2>/dev/null; then
-    rm -f "$tmp"
-    return 1
+  if ! curl -4 -fsSL --connect-timeout 5 --max-time 30 "$url" > "$tmp" 2>"$err"; then
+    curl_status=$?
+    if ! curl -fsSL --connect-timeout 5 --max-time 30 "$url" > "$tmp" 2>>"$err"; then
+      GET_NODES_LAST_URL="$url"
+      GET_NODES_LAST_ERROR=$(tr '\n' ' ' < "$err" | sed 's/[[:space:]][[:space:]]*/ /g' | cut -c1-240)
+      GET_NODES_LAST_STATUS="$curl_status"
+      rm -f "$tmp" "$err"
+      return 1
+    fi
   fi
+  rm -f "$err"
 
   REMOTE_CDN4_NODES=()
   REMOTE_CDN6_NODES=()
@@ -505,6 +558,14 @@ load_remote_nodes() {
     IFS='|' read -r type family prov isp host ip port target backup_host backup_ip backup_port backup_target <<< "$line"
     [ "$type" = "type" ] && continue
     [ -n "$ip" ] || continue
+    # 国内三网节点只保留上海电信/联通/移动，其他省份和其它运营商直接丢弃。
+    if [ "$type" = "cdn" ]; then
+      [ "$prov" = "$DOMESTIC_PROVINCE" ] || continue
+      case "$isp" in
+        电信|联通|移动) ;;
+        *) continue ;;
+      esac
+    fi
     port=${port:-80}
     case "$type:$family" in
       cdn:4) REMOTE_CDN4_NODES+=("$prov|$isp|$host|$ip|$port|$backup_host|$backup_ip|${backup_port:-80}") ;;
@@ -529,7 +590,8 @@ require_remote_nodes() {
     return 0
   fi
   echo -e "${RED}[X] 无法从 getNodes 获取节点 IP+端口，请稍后重试${NC}"
-  echo -e "${DIM}    getNodes: ${GET_NODES_URL}  scope=${scope}${NC}"
+  echo -e "${DIM}    getNodes: ${GET_NODES_LAST_URL:-${GET_NODES_URL}}${NC}"
+  [ -n "$GET_NODES_LAST_ERROR" ] && echo -e "${DIM}    curl: ${GET_NODES_LAST_ERROR}${NC}"
   exit 1
 }
 
@@ -564,7 +626,7 @@ TcpQuality 节点 TCP 丢包探测脚本
 
 NixOS:
   脚本会自动通过 nix shell 提供运行依赖，不会写入 environment.systemPackages。
-  使用 --speedtest/--only-speedtest 时会临时下载 tosutil 做三网单线程速度。
+  使用 --speedtest/--only-speedtest 时会通过 curl --resolve 固定 TOS IP 做单线程测速。
 
 选项:
   -h, --help        显示帮助信息并退出
@@ -572,25 +634,29 @@ NixOS:
   -s, --size NUM    指定 IP 包总长度（单位 B），0 为标准无负载 SYN；默认 0
                      小于协议头部的数值按最小头部长度发送
   -p, --parallel NUM
-                     设置并行节点数，范围 1-31，默认 ${PARALLEL}
+                     设置并行节点数，范围 1-31，默认按内存自动选择
   -v4, --v4         仅探测 IPv4
   -v6, --v6         仅探测 IPv6
   --only-large      仅探测 IPv4大包回程
   --cernet          仅探测 CERNET IPv4 和 CERNET2 IPv6
-  --all             探测 IPv4/IPv6、CERNET/CERNET2、国际互联和三网单线程速度
+  --all             探测 IPv4/IPv6、CERNET/CERNET2、国际互联和单线程测速
   --route           仅做三网回程线路识别，不执行 nping 丢包探测、不上传报告
   --route-protocol PROTO
                     设置 --route 的 traceroute 协议: tcp、udp、both，默认 tcp
-  --speedtest       追加三网单线程速度（默认北京/上海/广东三地三网）
-  --only-speedtest  仅运行三网单线程速度（默认北京/上海/广东三地三网）
-  --speedtest-staged
-                    追加北京三网三段限速测试
-  --only-speedtest-staged
-                    仅运行北京三网三段限速测试
+  --speedtest       追加单线程测速（固定上海三网）
+  --only-speedtest  仅运行单线程测速（固定上海三网）
   --intl            单独使用时仅运行国际互联；与 -v4/-v6/--all 等组合时追加国际互联
-  --province CODE   仅检测指定省份，可重复；也支持简写参数如 -bj、-sh、-gd
-                     注意: 山西使用 -sx，陕西使用 -sn
+  --no-rank-upload  不上传报告，也不参与速度排名
+  --province CODE   上海精简版仅接受 sh/上海；-sh 也可使用
+                     其它省份参数已禁用，避免重新加入外省节点
   --debug           保留临时文件并输出调试信息，便于排查线路识别问题
+
+国际互联：
+  CDN 目标优先使用静态资源入口；每个域名最多探测 2 个公网 IPv4，结果合并统计。
+  国际节点分别执行 iPerf3 上传和下载（-R）；每个方向显示 TCP RTT 与重传次数，每行最多三个节点。
+  国际节点 iPerf3 默认限速 1M、测试 5 秒；每个节点/协议/方向最多尝试 10 次，成功即停止；可用 TCPQUALITY_INTERNATIONAL_IPERF_RATE/TCPQUALITY_INTERNATIONAL_IPERF_SECONDS 覆盖。
+  设置 TCPQUALITY_INTERNATIONAL_MAX_IPS=1 可恢复每个域名只探测一个地址。
+  --debug 还会保存国际互联目标的候选 IP、HTTP 状态、边缘和缓存信息。
 
 示例:
   bash <(curl -sL https://raw.githubusercontent.com/ibsgss/TcpQuality/main/runTcpQuality.sh) -c 100
@@ -601,18 +667,19 @@ NixOS:
 依赖:
   - nping: 随 nmap 安装
   - curl: 用于检测公网 IPv4/IPv6 与上传报告
+  - iperf3/jq/ss: 国际节点 iPerf3 TCP RTT、双向重传与反向 TCP_INFO RTT 解析
   - traceroute: 用于自动识别三网 TCP 回程线路
   - nexttrace-tiny: 可选；用于 IPv4大包回程的 TCP 1200B 大包路由识别
-  - tosutil/iproute2/kmod: 三网单线程速度使用
+  - curl/iproute2: 单线程测速使用
   - awk/sed/grep: 用于结果解析和展示
 
 安装提示:
   - NixOS:          无需安装，脚本自动进入临时 nix shell
-  - Debian/Ubuntu: apt-get install -y curl nmap traceroute
-  - RHEL/Fedora:   dnf install -y curl nmap traceroute
-  - Alpine Linux:  apk add curl nmap-nping traceroute
-  - Arch Linux:    pacman -S curl nmap traceroute
-  - macOS:         brew install curl nmap traceroute
+  - Debian/Ubuntu: apt-get install -y curl nmap iperf3 iproute2 jq traceroute
+  - RHEL/Fedora:   dnf install -y curl nmap iperf3 iproute jq traceroute
+  - Alpine Linux:  apk add curl nmap-nping iperf3 iproute2 jq traceroute
+  - Arch Linux:    pacman -S curl nmap iperf3 iproute2 jq traceroute
+  - macOS:         brew install curl nmap iperf3 jq traceroute
 
 说明:
   发送裸 TCP SYN 包通常需要 root 权限；请切换到 root 用户后运行。
@@ -649,6 +716,7 @@ parse_args() {
           exit 1
         fi
         PARALLEL="$2"
+        PARALLEL_EXPLICIT=1
         shift 2
         ;;
       -v4|--v4)
@@ -695,21 +763,15 @@ parse_args() {
         SPEEDTEST_ONLY=1
         shift
         ;;
-      --speedtest-staged)
-        SPEEDTEST_ENABLED=1
-        SPEEDTEST_MODE="staged"
-        shift
-        ;;
-      --only-speedtest-staged)
-        SPEEDTEST_ENABLED=1
-        SPEEDTEST_ONLY=1
-        SPEEDTEST_MODE="staged"
-        shift
-        ;;
       --intl)
         INTL_REQUESTED=1
         INTERNATIONAL_ENABLED=1
-        UPLOAD_REPORT=1
+        [ "$REPORT_UPLOAD_FORCED_OFF" -eq 1 ] || UPLOAD_REPORT=1
+        shift
+        ;;
+      --no-rank-upload)
+        UPLOAD_REPORT=0
+        REPORT_UPLOAD_FORCED_OFF=1
         shift
         ;;
       --debug)
@@ -745,6 +807,7 @@ parse_args() {
     ONLY_IPV6=0
     TEST_CERNET=0
     TEST_ALL=0
+    INCLUDE_DEFAULT_ROUTE=0
     ROUTE_MODE=0
     SPEEDTEST_ENABLED=0
     SPEEDTEST_ONLY=0
@@ -758,11 +821,43 @@ parse_args() {
     && [ "$ONLY_IPV6" -eq 0 ] \
     && [ "$TEST_CERNET" -eq 0 ] \
     && [ "$TEST_ALL" -eq 0 ] \
+    && [ "$INCLUDE_DEFAULT_ROUTE" -eq 0 ] \
     && [ "$ROUTE_MODE" -eq 0 ] \
     && [ "$SPEEDTEST_ENABLED" -eq 0 ] \
     && [ -z "$SELECTED_PROVINCES" ]; then
     INTERNATIONAL_ONLY=1
   fi
+}
+
+detect_total_memory_mb() {
+  local mem_kb=""
+  if [ -r /proc/meminfo ]; then
+    mem_kb=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || true)
+    if [[ "$mem_kb" =~ ^[0-9]+$ ]] && [ "$mem_kb" -gt 0 ]; then
+      echo $((mem_kb / 1024))
+      return
+    fi
+  fi
+  if command -v free >/dev/null 2>&1; then
+    free -m 2>/dev/null | awk '/^Mem:/ {print $2; exit}'
+    return
+  fi
+  echo 512
+}
+
+auto_parallel_by_memory() {
+  local mem_mb parallel
+  mem_mb=$(detect_total_memory_mb)
+  [[ "$mem_mb" =~ ^[0-9]+$ ]] || mem_mb=512
+  parallel=$(((mem_mb + 47) / 48))
+  [ "$parallel" -lt 1 ] && parallel=1
+  [ "$parallel" -gt 93 ] && parallel=93
+  echo "$parallel"
+}
+
+apply_auto_parallel() {
+  [ "$PARALLEL_EXPLICIT" -eq 1 ] && return
+  PARALLEL=$(auto_parallel_by_memory)
 }
 
 # ===================== 工具函数 =====================
@@ -831,7 +926,10 @@ count_route_progress() {
 }
 
 count_international_progress() {
-  find "$RESULT_DIR" -maxdepth 1 -type f -name 'internet_[0-9]*' 2>/dev/null | wc -l | tr -d ' '
+  find "$RESULT_DIR" -maxdepth 1 -type f \( \
+    -name 'internet_[0-9]*' \
+    -o -name 'international_latency_[46]_[a-z]*_[0-9]*' \
+  \) ! -name '*.debug' ! -name '*.http' 2>/dev/null | wc -l | tr -d ' '
 }
 
 count_selected_cdn_nodes() {
@@ -925,7 +1023,15 @@ awk_table_helpers() {
     if (text == "三网概览") return 8
     if (text == "教育网概览") return 10
     if (text == "黑龙江" || text == "内蒙古") return 6
-    if (text == "服务" || text == "域名" || text == "可达" || text == "延迟") return 4
+    if (text == "区域" || text == "节点" || text == "服务" || text == "域名" || text == "可达" || text == "延迟") return 4
+    if (text == "亚洲" || text == "美洲" || text == "欧洲" || text == "悉尼" || text == "香港" || text == "日本") return 4
+    if (text == "大洋洲") return 6
+    if (text == "新加坡") return 6
+    if (text == "澳大利亚-悉尼") return 13
+    if (text == "加拿大-蒙特利尔" || text == "巴西-里约热内卢" || text == "荷兰-阿姆斯特丹") return 15
+    if (text == "德国-法兰克福") return 13
+    if (text == "英国-伦敦") return 9
+    if (text == "美国西部-洛杉矶" || text == "美国中部-达拉斯" || text == "美国东部-芝加哥") return 15
     if (text == "丢包率") return 6
     if (text == "重传") return 4
     if (text == "✓" || text == "x") return 1
@@ -1029,7 +1135,7 @@ show_provider_summary() {
   function cell(status, loss, lat, label,   l, v, latency, loss_text) {
     if (label == "") label = "Hidden"
     if (status != "OK") {
-      return format_summary_cell(label, "failed", "failed", red, red)
+      return format_summary_cell("failed", "failed", "failed", red, red)
     }
     l = loss + 0
     v = lat + 0
@@ -1065,7 +1171,7 @@ show_provider_summary() {
       prov = order[i]
       printf "  %s%s%s  %s %s/ %s %s/ %s\n", cyan, label_cell(prov), nc, data[prov SUBSEP "电信"], white, data[prov SUBSEP "联通"], white, data[prov SUBSEP "移动"]
     }
-    printf "  %s颜色: %s正常%s  %s延迟151-240ms或1-20%%重传%s  %s延迟>240ms或>20%%重传，或失败%s\n\n", dim, green, dim, yellow, dim, red, dim
+    printf "  %s颜色: %s正常%s  %s延迟151-240ms或1-20%%重传%s  %s延迟>240ms或>20%%重传，或失败%s\n\n", dim, green, dim, yellow, dim, red, nc
   }' "${route_file:-/dev/null}" "$file"
 }
 
@@ -1140,7 +1246,7 @@ show_large_packet_results() {
   function cell(status, loss, lat, label,   l, v, latency, loss_text) {
     if (label == "") label = "Hidden"
     if (status == "SKIP") return format_summary_cell(label, "-", "-", red, red)
-    if (status != "OK") return format_summary_cell(label, "failed", "failed", red, red)
+    if (status != "OK") return format_summary_cell("failed", "failed", "failed", red, red)
     l = loss + 0
     v = lat + 0
     latency = latency_text(v, l)
@@ -1186,10 +1292,10 @@ show_large_packet_results() {
       printf "  %s%s%s  %s %s/ %s %s/ %s\n", cyan, label_cell(prov), nc, data[prov SUBSEP "电信"], white, data[prov SUBSEP "联通"], white, data[prov SUBSEP "移动"]
     }
     if (firewall_limited + 0 == 1) {
-      printf "  %s颜色: %s正常%s  %s延迟151-240ms或1-20%%重传%s  %s延迟>240ms或>20%%重传，或失败%s\n", dim, green, dim, yellow, dim, red, dim
-      printf "  %s提示: 由于服务商防火墙限制，延迟和丢包无法探测%s\n\n", red, dim
+      printf "  %s颜色: %s正常%s  %s延迟151-240ms或1-20%%重传%s  %s延迟>240ms或>20%%重传，或失败%s\n", dim, green, dim, yellow, dim, red, nc
+      printf "  %s提示: 由于服务商防火墙限制，延迟和丢包无法探测%s\n\n", red, nc
     } else {
-      printf "  %s颜色: %s正常%s  %s延迟151-240ms或1-20%%重传%s  %s延迟>240ms或>20%%重传，或失败%s\n", dim, green, dim, yellow, dim, red, dim
+      printf "  %s颜色: %s正常%s  %s延迟151-240ms或1-20%%重传%s  %s延迟>240ms或>20%%重传，或失败%s\n", dim, green, dim, yellow, dim, red, nc
       printf "\n"
     }
   }' "${route_file:-/dev/null}" "$file"
@@ -1198,6 +1304,11 @@ show_large_packet_results() {
 show_education_results() {
   local title="$1" file="$2"
   awk -F'|' -v title="$title" -v green="$GREEN" -v yellow="$YELLOW" -v red="$RED" -v cyan="$CYAN" -v white="$WHITE" -v dim="$DIM" -v bold="$BOLD" -v nc="$NC" '
+  BEGIN {
+    route_w = 14
+    latency_w = 6
+    loss_w = 6
+  }
   function compact_loss(v) {
     return int(v + 0.5)
   }
@@ -1218,10 +1329,10 @@ show_education_results() {
   }
   function cell(status, loss, lat, label,   l, v, color) {
     if (label == "") label = title
-    if (status != "OK") return white sprintf("%11s", label) nc " " red sprintf("%6s", "failed") nc " " red sprintf("%6s", "failed") nc
+    if (status != "OK") return white sprintf("%" route_w "s", "failed") nc " " red sprintf("%" latency_w "s", "failed") nc " " red sprintf("%" loss_w "s", "failed") nc
     l = loss + 0
     v = lat + 0
-    return white sprintf("%11s", label) nc " " latency_color(v, l) latency_text(v, l) nc " " loss_color(l) sprintf("%6s", compact_loss(loss) "%") nc
+    return white sprintf("%" route_w "s", label) nc " " latency_color(v, l) sprintf("%" latency_w "s", latency_text(v, l)) nc " " loss_color(l) sprintf("%" loss_w "s", compact_loss(loss) "%") nc
   }
   {
     status = $1
@@ -1245,7 +1356,7 @@ show_education_results() {
       prov_pad = (prov == "黑龙江" || prov == "内蒙古") ? "  " : "    "
       printf "  %s%s%s%s  %s\n", cyan, prov, nc, prov_pad, result[prov]
     }
-    printf "  %s颜色: %s正常%s  %s延迟151-240ms或1-20%%重传%s  %s延迟>240ms或>20%%重传，或失败%s\n\n", dim, green, dim, yellow, dim, red, dim
+    printf "  %s颜色: %s正常%s  %s延迟151-240ms或1-20%%重传%s  %s延迟>240ms或>20%%重传，或失败%s\n\n", dim, green, dim, yellow, dim, red, nc
   }' "$file"
 }
 
@@ -1254,7 +1365,7 @@ show_education_combined() {
   awk -F'|' -v green="$GREEN" -v yellow="$YELLOW" -v red="$RED" -v cyan="$CYAN" -v white="$WHITE" -v dim="$DIM" -v bold="$BOLD" -v nc="$NC" '
   BEGIN {
     label_w = 10
-    route_w = 11
+    route_w = 18
     latency_w = 6
     loss_w = 6
     edu_cell_w = route_w + 1 + latency_w + 1 + loss_w
@@ -1301,7 +1412,7 @@ show_education_combined() {
   }
   function cell(status, loss, lat, label, fallback,   l, v, latency, loss_text) {
     if (label == "") label = fallback
-    if (status != "OK") return format_edu_cell(label, "failed", "failed", red, red)
+    if (status != "OK") return format_edu_cell("failed", "failed", "failed", red, red)
     l = loss + 0
     v = lat + 0
     latency = latency_text(v, l)
@@ -1335,7 +1446,7 @@ show_education_combined() {
       prov = order[i]
       printf "  %s%s%s  %s %s/ %s\n", cyan, label_cell(prov), nc, result[prov SUBSEP 1], white, result[prov SUBSEP 2]
     }
-    printf "  %s颜色: %s正常%s  %s延迟151-240ms或1-20%%重传%s  %s延迟>240ms或>20%%重传，或失败%s\n\n", dim, green, dim, yellow, dim, red, dim
+    printf "  %s颜色: %s正常%s  %s延迟151-240ms或1-20%%重传%s  %s延迟>240ms或>20%%重传，或失败%s\n\n", dim, green, dim, yellow, dim, red, nc
   }' "$ipv4_file" "$ipv6_file"
 }
 
@@ -1443,9 +1554,16 @@ is_valid_ipv6() {
 
 get_public_ipv4() {
   local api response
-  local apis=("ip.sb" "ping0.cc" "icanhazip.com" "api64.ipify.org" "ifconfig.co" "ident.me")
+  local apis=(
+    "https://api.ipify.org"
+    "https://ipv4.icanhazip.com"
+    "https://ifconfig.me/ip"
+    "https://ifconfig.co/ip"
+    "https://ident.me"
+    "https://ip.sb"
+  )
   for api in "${apis[@]}"; do
-    response=$(curl -s4 --max-time 8 "$api" 2>/dev/null | awk 'NR==1 {gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print}')
+    response=$(curl -fsS4L --max-time 8 "$api" 2>/dev/null | awk 'NR==1 {gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print}')
     if [[ "$response" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && is_public_ipv4 "$response"; then
       IPV4_PUBLIC="$response"
       IPV4_WORK=1
@@ -1482,33 +1600,234 @@ ipv4_available() {
   [ "$IPV4_WORK" -eq 1 ]
 }
 
+report_api_base() {
+  printf '%s' "${REPORT_API%/generate}"
+}
+
+ensure_public_ips_for_rank() {
+  if [ -z "${IPV4_PUBLIC:-}" ]; then
+    get_public_ipv4 || true
+  fi
+  if [ -z "${IPV6_PUBLIC:-}" ]; then
+    get_public_ipv6 || true
+  fi
+}
+
+upload_route_trace_bundle() {
+  local report_id="$1" section="$2" prefix="$3" trace_glob bundle list_file manifest_file response_file endpoint http_code count
+  trace_glob="$RESULT_DIR/${prefix}_trace_*"
+  compgen -G "$trace_glob" >/dev/null || return 0
+  command -v tar >/dev/null 2>&1 || return 0
+  command -v curl >/dev/null 2>&1 || return 0
+
+  bundle=$(mktemp "${TMPDIR:-/tmp}/tcpquality-${section}.XXXXXX.tar.gz") || return 0
+  list_file=$(mktemp "${TMPDIR:-/tmp}/tcpquality-${section}.XXXXXX.list") || {
+    rm -f "$bundle"
+    return 0
+  }
+  manifest_file="$RESULT_DIR/${prefix}_trace_manifest.json"
+  count=$(find "$RESULT_DIR" -maxdepth 1 -type f -name "${prefix}_trace_*" | wc -l | tr -d ' ')
+  printf '{"reportId":"%s","section":"%s","prefix":"%s","generatedAt":"%s","traceFiles":%s}\n' \
+    "$report_id" "$section" "$prefix" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${count:-0}" > "$manifest_file"
+  find "$RESULT_DIR" -maxdepth 1 -type f -name "${prefix}_trace_*" -exec basename {} \; > "$list_file"
+  basename "$manifest_file" >> "$list_file"
+  if ! tar -C "$RESULT_DIR" -czf "$bundle" -T "$list_file" 2>/dev/null; then
+    rm -f "$bundle" "$list_file"
+    return 0
+  fi
+
+  response_file=$(mktemp)
+  endpoint="$(report_api_base)/route-traces/${report_id}.${section}.tar.gz"
+  if http_code=$(curl -4 -sS --connect-timeout 10 --max-time 30 --retry 2 \
+    -o "$response_file" -w '%{http_code}' \
+    -H 'Content-Type: application/gzip' \
+    --data-binary "@$bundle" "$endpoint" 2>/dev/null); then
+    if [ "$DEBUG_MODE" -eq 1 ]; then
+      printf '%s\n' "$http_code" > "$RESULT_DIR/route_trace_${section}_upload_http_code.txt"
+      cp "$response_file" "$RESULT_DIR/route_trace_${section}_upload_response.json" 2>/dev/null || true
+    fi
+  elif [ "$DEBUG_MODE" -eq 1 ]; then
+    printf '%s\n' "curl_failed" > "$RESULT_DIR/route_trace_${section}_upload_http_code.txt"
+  fi
+  rm -f "$bundle" "$list_file" "$response_file"
+}
+
+upload_route_trace_bundles() {
+  local report_id="$1"
+  [ -n "$report_id" ] || return 0
+  upload_route_trace_bundle "$report_id" "ipv4" "summary_route4"
+  upload_route_trace_bundle "$report_id" "ipv4_large" "summary_large_route4"
+  upload_route_trace_bundle "$report_id" "ipv6" "summary_route6"
+  upload_route_trace_bundle "$report_id" "cernet_ipv4" "edu_route4"
+  upload_route_trace_bundle "$report_id" "cernet2_ipv6" "edu_route6"
+}
+
+upload_speedtest_debug_bundle() {
+  local report_id="$1" debug_dir="$RESULT_DIR/speedtest-debug" bundle response_file endpoint http_code
+  [ -n "$report_id" ] || return 0
+  [ -d "$debug_dir" ] || return 0
+  find "$debug_dir" -type f | grep -q . || return 0
+  command -v tar >/dev/null 2>&1 || return 0
+  command -v curl >/dev/null 2>&1 || return 0
+
+  printf '{"reportId":"%s","generatedAt":"%s","type":"speedtest-debug"}\n' \
+    "$report_id" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$debug_dir/manifest.json"
+  bundle=$(mktemp "${TMPDIR:-/tmp}/tcpquality-speedtest-debug.XXXXXX.tar.gz") || return 0
+  if ! tar -C "$debug_dir" -czf "$bundle" . 2>/dev/null; then
+    rm -f "$bundle"
+    return 0
+  fi
+
+  response_file=$(mktemp)
+  endpoint="$(report_api_base)/speedtest-debug/${report_id}.tar.gz"
+  if http_code=$(curl -4 -sS --connect-timeout 10 --max-time 30 --retry 2 \
+    -o "$response_file" -w '%{http_code}' \
+    -H 'Content-Type: application/gzip' \
+    --data-binary "@$bundle" "$endpoint" 2>/dev/null); then
+    if [ "$DEBUG_MODE" -eq 1 ]; then
+      printf '%s\n' "$http_code" > "$RESULT_DIR/speedtest_debug_upload_http_code.txt"
+      cp "$response_file" "$RESULT_DIR/speedtest_debug_upload_response.json" 2>/dev/null || true
+    fi
+  elif [ "$DEBUG_MODE" -eq 1 ]; then
+    printf '%s\n' "curl_failed" > "$RESULT_DIR/speedtest_debug_upload_http_code.txt"
+  fi
+  rm -f "$bundle" "$response_file"
+}
+
+upload_probe_debug_bundle() {
+  local report_id="$1" bundle list_file response_file endpoint http_code count
+  [ "${DEBUG_MODE:-0}" -eq 1 ] || return 0
+  [ -n "$report_id" ] || return 0
+  command -v tar >/dev/null 2>&1 || return 0
+  command -v curl >/dev/null 2>&1 || return 0
+
+  list_file=$(mktemp "${TMPDIR:-/tmp}/tcpquality-probe-debug.XXXXXX.list") || return 0
+  {
+    find "$RESULT_DIR" -maxdepth 1 -type f \
+      \( -name 'nping_*.log' \
+        -o -name 'nping_*_meta.txt' \
+        -o -name 'backup_retry_meta.txt' \
+        -o -name 'route_debug_meta.txt' \
+        -o -name 'report_upload.csv' \
+        -o -name 'report_upload*.json' \
+        -o -name 'report_upload*.txt' \
+        -o -name 'route_trace_*_upload*.json' \
+        -o -name 'route_trace_*_upload*.txt' \
+        -o -name 'speedtest_debug_upload*.json' \
+        -o -name 'speedtest_debug_upload*.txt' \
+        -o -name 'speedtest.log' \
+        -o -name 'speedtest.progress' \
+        -o -name 'speedtest.state' \
+        -o -name 'internet_*.ips' \
+        -o -name 'internet_*.http' \) \
+      -exec basename {} \;
+    find "$RESULT_DIR" -maxdepth 2 -type f -path '*/speedtest.*/*' \
+      | sed "s#^$RESULT_DIR/##"
+  } | sort -u > "$list_file"
+  count=$(wc -l < "$list_file" | tr -d ' ')
+  [ "${count:-0}" -gt 0 ] 2>/dev/null || {
+    rm -f "$list_file"
+    return 0
+  }
+
+  printf '{"reportId":"%s","generatedAt":"%s","type":"probe-debug","files":%s}\n' \
+    "$report_id" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${count:-0}" > "$RESULT_DIR/probe_debug_manifest.json"
+  printf '%s\n' "probe_debug_manifest.json" >> "$list_file"
+
+  bundle=$(mktemp "${TMPDIR:-/tmp}/tcpquality-probe-debug.XXXXXX.tar.gz") || {
+    rm -f "$list_file"
+    return 0
+  }
+  if ! tar -C "$RESULT_DIR" -czf "$bundle" -T "$list_file" 2>/dev/null; then
+    rm -f "$bundle" "$list_file"
+    return 0
+  fi
+
+  response_file=$(mktemp)
+  endpoint="$(report_api_base)/probe-debug/${report_id}.tar.gz"
+  if http_code=$(curl -4 -sS --connect-timeout 10 --max-time 30 --retry 2 \
+    -o "$response_file" -w '%{http_code}' \
+    -H 'Content-Type: application/gzip' \
+    --data-binary "@$bundle" "$endpoint" 2>/dev/null); then
+    printf '%s\n' "$http_code" > "$RESULT_DIR/probe_debug_upload_http_code.txt"
+    cp "$response_file" "$RESULT_DIR/probe_debug_upload_response.json" 2>/dev/null || true
+  else
+    printf '%s\n' "curl_failed" > "$RESULT_DIR/probe_debug_upload_http_code.txt"
+  fi
+  rm -f "$bundle" "$list_file" "$response_file"
+}
+
 upload_report() {
-  local csv="$1" report_time="${2:-}" response_file http_code report_url today_uses total_uses
+  local csv="$1" report_time="${2:-}" response_file curl_err http_code report_id report_url today_uses total_uses rank_updated rank_reject_reason rank_finished_at
+  local rank_headers=()
   if ! command -v curl &>/dev/null; then
     echo -e "  ${YELLOW}[!] 依赖不完整，已跳过 SVG 报告上传${NC}"
     return
   fi
+  if grep -qE '^(Speedtest|三网单线程速度),' "$csv" 2>/dev/null; then
+    ensure_public_ips_for_rank
+  fi
+  if [ -n "${RANK_SESSION_ID:-}" ] && [ -n "${RANK_SESSION_TOKEN:-}" ]; then
+    rank_headers+=(-H "X-TcpQuality-Rank-Session: $RANK_SESSION_ID")
+    rank_headers+=(-H "X-TcpQuality-Rank-Token: $RANK_SESSION_TOKEN")
+    rank_headers+=(-H "X-TcpQuality-Rank-Started-At: ${RANK_SESSION_STARTED_AT:-}")
+    rank_headers+=(-H "X-TcpQuality-Rank-Expires-At: ${RANK_SESSION_EXPIRES_AT:-}")
+    rank_headers+=(-H "X-TcpQuality-Rank-Session-IPv4: ${RANK_SESSION_IP4:-}")
+  fi
+  if [ -n "${SPEEDTEST_RANK_DISABLED_REASON:-}" ]; then
+    rank_headers+=(-H "X-TcpQuality-Rank-Disabled-Reason: $SPEEDTEST_RANK_DISABLED_REASON")
+  fi
 
   response_file=$(mktemp)
-  if ! http_code=$(curl -sS --connect-timeout 10 --max-time 30 --retry 2 \
+  curl_err=$(mktemp)
+  if [ "$DEBUG_MODE" -eq 1 ] && [ -f "$csv" ]; then
+    cp "$csv" "$RESULT_DIR/report_upload.csv" 2>/dev/null || true
+  fi
+  rank_finished_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  if ! http_code=$(curl -4 -sS --connect-timeout 10 --max-time 30 --retry 2 \
     -o "$response_file" -w '%{http_code}' \
     -H 'Content-Type: text/csv; charset=utf-8' \
     -H "X-Report-Time: $report_time" \
-    --data-binary "@$csv" "$REPORT_API"); then
+    -H "X-TcpQuality-Public-IPv4: ${IPV4_PUBLIC:-}" \
+    -H "X-TcpQuality-Public-IPv6: ${IPV6_PUBLIC:-}" \
+    -H "X-TcpQuality-Rank-Finished-At: $rank_finished_at" \
+    "${rank_headers[@]}" \
+    --data-binary "@$csv" "$REPORT_API" 2>"$curl_err"); then
     echo -e "  ${YELLOW}[!] SVG 报告上传失败，本地 CSV 已保留${NC}"
-    rm -f "$response_file"
+    if [ "$DEBUG_MODE" -eq 1 ]; then
+      cp "$response_file" "$RESULT_DIR/report_upload_response.json" 2>/dev/null || true
+      cp "$curl_err" "$RESULT_DIR/report_upload_curl.err" 2>/dev/null || true
+      printf '%s\n' "curl_failed" > "$RESULT_DIR/report_upload_http_code.txt"
+    fi
+    rm -f "$response_file" "$curl_err"
     return
+  fi
+  rm -f "$curl_err"
+  if [ "$DEBUG_MODE" -eq 1 ]; then
+    cp "$response_file" "$RESULT_DIR/report_upload_response.json" 2>/dev/null || true
+    printf '%s\n' "$http_code" > "$RESULT_DIR/report_upload_http_code.txt"
   fi
 
   if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+    report_id=$(sed -nE 's/.*"id":"([^"]+)".*/\1/p' "$response_file" | head -1)
     report_url=$(sed -nE 's/.*"url":"([^"]+)".*/\1/p' "$response_file" | head -1)
     today_uses=$(sed -nE 's/.*"todayUses":([0-9]+).*/\1/p' "$response_file" | head -1)
     total_uses=$(sed -nE 's/.*"totalUses":([0-9]+).*/\1/p' "$response_file" | head -1)
+    rank_updated=$(sed -nE 's/.*"rankUpdated":(true|false).*/\1/p' "$response_file" | head -1)
+    rank_reject_reason=$(sed -nE 's/.*"rankRejectReason":"([^"]*)".*/\1/p' "$response_file" | head -1)
+  fi
+  if [ -n "$report_id" ]; then
+    upload_route_trace_bundles "$report_id"
+    upload_speedtest_debug_bundle "$report_id"
+    upload_probe_debug_bundle "$report_id"
   fi
   if [ -n "$report_url" ]; then
     echo -e "  ${WHITE}报告链接：${UNDERLINE}${report_url}${NC}"
     if [ -n "$today_uses" ] && [ -n "$total_uses" ]; then
       echo -e "  ${DIM}今日TCP脚本使用次数：${today_uses}；总使用次数：${total_uses}。感谢使用ibsgss网络质量检测脚本！${NC}"
+    fi
+    if [ "$DEBUG_MODE" -eq 1 ] && [ "$rank_updated" = "false" ] && [ -n "$rank_reject_reason" ]; then
+      echo -e "  ${YELLOW}[!] 排名未更新：${rank_reject_reason}${NC}"
     fi
   else
     echo -e "  ${YELLOW}[!] SVG 报告上传失败（HTTP $http_code），本地 CSV 已保留${NC}"
@@ -1572,7 +1891,7 @@ route_needs_10099_hidden_tcp_retry() {
       return 1
     }
     function is_10099(ip) {
-      return ip ~ /^103\.214\./ || ip ~ /^103\.228\.68\./ || ip ~ /^103\.239\.176\./ || ip ~ /^118\.26\.151\./ || ip ~ /^162\.219\.(3[2-9]|85)\./ || ip ~ /^202\.77\.23\./ || ip ~ /^203\.160\.75\./
+      return ip ~ /^103\.214\./ || ip ~ /^103\.228\.68\./ || ip ~ /^103\.239\.176\./ || ip ~ /^118\.26\.151\./ || ip ~ /^162\.219\.(3[2-9]|85)\./ || ip ~ /^162\.245\.124\./ || ip ~ /^202\.77\.23\./ || ip ~ /^203\.160\.(66|75)\./
     }
     function is_4837(ip) {
       return ip ~ /^219\.158\./
@@ -1636,9 +1955,35 @@ build_asn_map() {
       ip = $2
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", asn)
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", ip)
-      if (asn ~ /^[0-9]+$/ && ip ~ /^[0-9A-Fa-f:.]+$/) print ip "|" asn
+      owner = $7
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", owner)
+      count = split(asn, values, /[[:space:]]+/)
+      asn = values[count]
+      if (asn ~ /^[0-9]+$/ && ip ~ /^[0-9A-Fa-f:.]+$/) print tolower(ip) "|" asn "|" owner
     }
   ' "$cymru_file" > "$map_file"
+}
+
+append_server_asn_meta() {
+  local ip_file="$1" map_file="$2" response_file
+  [ -s "$ip_file" ] || return 0
+  response_file=$(mktemp)
+  if curl -4 -fsSL --connect-timeout 5 --max-time 20 \
+      -X POST -H 'content-type: text/plain; charset=utf-8' \
+      --data-binary "@$ip_file" "$ROUTE_ASN_API" > "$response_file" 2>/dev/null; then
+    awk -F'\t' '
+      NR == 1 { next }
+      {
+        ip = tolower($1)
+        asn = $2
+        owner = $3
+        sub(/^[Aa][Ss]/, "", asn)
+        gsub(/[|\r\n]+/, " ", owner)
+        if (ip ~ /^[0-9A-Fa-f:.]+$/ && asn ~ /^[0-9]+$/) print ip "|" asn "|" owner
+      }
+    ' "$response_file" >> "$map_file"
+  fi
+  rm -f "$response_file"
 }
 
 route_label_from_ip_trace() {
@@ -1655,7 +2000,9 @@ route_label_from_ip_trace() {
       if (ip ~ /^2408:/) return "4837"
       if (ip ~ /^223\.120\./ || ip ~ /^223\.119\./) return "58453"
       if (ip ~ /^221\.183\./ || ip ~ /^111\.24\./ || ip ~ /^111\.13\./) return "9808"
-      if (ip ~ /^103\.214\./ || ip ~ /^103\.228\.68\./ || ip ~ /^103\.239\.176\./ || ip ~ /^118\.26\.151\./ || ip ~ /^162\.219\.(3[2-9]|85)\./ || ip ~ /^202\.77\.23\./ || ip ~ /^203\.160\.75\./) return "10099"
+      if (ip ~ /^2402:4f00:f000:/) return "58807"
+      if (ip ~ /^2409:8080:/) return "9808"
+      if (ip ~ /^103\.214\./ || ip ~ /^103\.228\.68\./ || ip ~ /^103\.239\.176\./ || ip ~ /^118\.26\.151\./ || ip ~ /^162\.219\.(3[2-9]|85)\./ || ip ~ /^162\.245\.124\./ || ip ~ /^202\.77\.23\./ || ip ~ /^203\.160\.(66|75)\./) return "10099"
       if (ip ~ /^2401:8a00:/) return "10099"
       if (ip ~ /^210\.14\./ || ip ~ /^210\.51\./ || ip ~ /^210\.78\./ || ip ~ /^218\.105\./) return "9929"
       if (ip ~ /^59\.64\./ || ip ~ /^101\.4\./ || ip ~ /^101\.76\./ || ip ~ /^111\.114\./ || ip ~ /^113\.54\./ || ip ~ /^115\.24\./ || ip ~ /^115\.156\./ || ip ~ /^183\.172\./ || ip ~ /^202\.38\.19/ || ip ~ /^202\.112\./ || ip ~ /^202\.113\./ || ip ~ /^202\.114\./ || ip ~ /^202\.115\./ || ip ~ /^202\.116\./ || ip ~ /^202\.117\./ || ip ~ /^202\.118\./ || ip ~ /^202\.119\./ || ip ~ /^202\.120\./ || ip ~ /^202\.194\./ || ip ~ /^202\.196\./ || ip ~ /^202\.197\./ || ip ~ /^202\.198\./ || ip ~ /^202\.200\./ || ip ~ /^202\.201\./ || ip ~ /^202\.202\./ || ip ~ /^202\.207\./ || ip ~ /^210\.2[6-9]\./ || ip ~ /^210\.3[0-9]\./ || ip ~ /^210\.4[0-7]\./ || ip ~ /^219\.22[4-9]\./ || ip ~ /^222\.(1[6-9]|2[0-3])\./ || ip ~ /^222\.19[2-9]\./ || ip ~ /^222\.20[0-7]\./) return "4538"
@@ -1689,14 +2036,40 @@ route_label_from_ip_trace() {
     function is_mobile_access_ip(ip) {
       return ip ~ /^111\.63\./ || ip ~ /^183\.201\./ || ip ~ /^183\.203\./
     }
+    function is_cmin2_asn(asn) {
+      return asn == "58807"
+    }
+    function is_cmi_asn(asn) {
+      return asn == "58453" || asn == "9808" || asn ~ /^5604[0-8]$/
+    }
+    function compact_combo_label(label,   parts, n) {
+      n = split(label, parts, "->")
+      if (n > 2) return parts[1] "->" parts[n]
+      return label
+    }
+    function mobile_label_before(last,   h, has_cmin2, has_cmi) {
+      if (last <= 1) return ""
+      for (h = 1; h < last; h++) {
+        if (is_cmin2_asn(asns[h])) has_cmin2 = 1
+        if (is_cmi_asn(asns[h]) || (target_isp == "移动" && (is_mobile_access_asn(asns[h]) || is_mobile_access_ip(ips[h])))) has_cmi = 1
+      }
+      if (has_cmin2 && has_cmi) return "CMIN2->CMI"
+      if (has_cmin2) return "CMIN2"
+      if (has_cmi) return "CMI"
+      return ""
+    }
     function is_oversea_163_ip(ip) {
       return ip ~ /^218\.30\./ || ip ~ /^145\.14\./ || ip ~ /^5\.154\./
     }
     function is_oversea_10099_ip(ip) {
-      return ip ~ /^103\.214\./ || ip ~ /^103\.228\.68\./ || ip ~ /^103\.239\.176\./ || ip ~ /^118\.26\.151\./ || ip ~ /^162\.219\.3[2-9]\./ || ip ~ /^202\.77\.23\./ || ip ~ /^2401:8a00:/
+      return ip ~ /^103\.214\./ || ip ~ /^103\.228\.68\./ || ip ~ /^103\.239\.176\./ || ip ~ /^118\.26\.151\./ || ip ~ /^162\.219\.3[2-9]\./ || ip ~ /^162\.245\.124\./ || ip ~ /^202\.77\.23\./ || ip ~ /^203\.160\.(66|75)\./ || ip ~ /^2401:8a00:/
     }
     function is_10099_entry_ip(ip) {
-      return ip ~ /^103\.214\./ || ip ~ /^103\.228\.68\./ || ip ~ /^103\.239\.176\./ || ip ~ /^118\.26\.151\./ || ip ~ /^162\.219\.(3[2-9]|85)\./ || ip ~ /^202\.77\.23\./ || ip ~ /^203\.160\.75\./ || ip ~ /^2401:8a00:/
+      return ip ~ /^103\.214\./ || ip ~ /^103\.228\.68\./ || ip ~ /^103\.239\.176\./ || ip ~ /^118\.26\.151\./ || ip ~ /^162\.219\.(3[2-9]|85)\./ || ip ~ /^162\.245\.124\./ || ip ~ /^202\.77\.23\./ || ip ~ /^203\.160\.(66|75)\./ || ip ~ /^2401:8a00:/
+    }
+    function is_10099_hop(asn, ip) {
+      # ASN 查询结果是权威判断；前缀只在 ASN 缺失时作为兜底。
+      return asn == "10099" || (asn == "" && is_10099_entry_ip(ip))
     }
     function is_oversea_cn2_ip(ip) {
       return ip ~ /^2605:9d80:/
@@ -1708,7 +2081,17 @@ route_label_from_ip_trace() {
       return asn == "9929" || asn == "4837" || asn == "4808"
     }
     function is_unicom_access_asn(asn) {
-      return asn == "136958" || asn == "140979"
+      return asn == "17816" || asn == "135061" || asn == "136958" || asn == "140979"
+    }
+    function is_unicom_route_hop(h) {
+      return is_unicom_backbone_asn(asns[h]) || is_unicom_backbone_ip(ips[h]) || is_unicom_access_asn(asns[h])
+    }
+    function has_163_before(last,   h) {
+      if (last <= 1) return 0
+      for (h = 1; h < last; h++) {
+        if (asns[h] == "4134" || asns[h] == "4847" || is_163_ip(ips[h])) return 1
+      }
+      return 0
     }
     function unicom_domestic_label_from_hop(first,   h, has_4837) {
       for (h = first + 1; h <= max_hop; h++) {
@@ -1718,31 +2101,35 @@ route_label_from_ip_trace() {
       if (has_4837) return "4837"
       return ""
     }
-    function unicom_route_combo_label(   h, first_unicom, domestic) {
+    function unicom_route_combo_label(   h, first_unicom, domestic, mobile_transit) {
       for (h = 1; h <= max_hop; h++) {
-        if (asns[h] == "10099" && is_10099_entry_ip(ips[h])) {
+        if (is_10099_hop(asns[h], ips[h])) {
           first_unicom = h
           domestic = unicom_domestic_label_from_hop(h)
           if (domestic != "") return "10099->" domestic
           return "10099"
         }
-        if (is_unicom_backbone_asn(asns[h]) || is_unicom_backbone_ip(ips[h])) {
+        if (is_unicom_route_hop(h)) {
           first_unicom = h
           break
         }
       }
-      return unicom_domestic_label_from_hop(first_unicom - 1)
+      domestic = unicom_domestic_label_from_hop(first_unicom - 1)
+      mobile_transit = mobile_label_before(first_unicom)
+      if (target_isp == "联通" && domestic != "" && mobile_transit != "") return compact_combo_label(mobile_transit "->" domestic)
+      if (target_isp == "联通" && domestic != "" && has_163_before(first_unicom)) return "163->" domestic
+      return domestic
     }
     function has_unicom_downstream(first,   h) {
       if (first <= 0) return 0
       for (h = first + 1; h <= max_hop; h++) {
-        if (is_unicom_backbone_asn(asns[h]) || is_unicom_backbone_ip(ips[h])) return 1
+        if (is_unicom_route_hop(h)) return 1
       }
       return 0
     }
     function has_10099_entry_to_unicom(   h) {
       for (h = 1; h <= max_hop; h++) {
-        if (asns[h] == "10099" && is_10099_entry_ip(ips[h]) && has_unicom_downstream(h)) return 1
+        if (is_10099_hop(asns[h], ips[h]) && has_unicom_downstream(h)) return 1
       }
       return 0
     }
@@ -1759,17 +2146,18 @@ route_label_from_ip_trace() {
         if (ips[h] !~ /^59\.43\.245\./) continue
         for (n = h + 1; n <= max_hop; n++) {
           if (ips[n] ~ /^59\.43\./) continue
-          return is_163_ip(ips[n]) || (target_isp == "电信" && (is_telecom_access_asn(asns[n]) || is_telecom_access_ip(ips[n])))
+          return asns[n] == "4134" || asns[n] == "4847" || is_163_ip(ips[n]) || (target_isp == "电信" && (is_telecom_access_asn(asns[n]) || is_telecom_access_ip(ips[n])))
         }
       }
       return 0
     }
     function is_mainland_backbone_hop(asn, ip) {
-      if (asn == "10099") return is_10099_entry_ip(ip)
+      if (is_10099_hop(asn, ip)) return 1
       if (asn == "9929" || asn == "4837" || asn == "4808") return 1
       if (asn == "4809") return !is_oversea_cn2_ip(ip)
-      if (asn == "4134") return is_163_ip(ip) || (target_isp == "电信" && (is_telecom_access_asn(asn) || is_telecom_access_ip(ip)))
-      if (asn == "4847") return 1
+      if (asn == "4134" || asn == "4847") return 1
+      if (is_163_ip(ip)) return 1
+      if (target_isp == "电信" && (is_telecom_access_asn(asn) || is_telecom_access_ip(ip))) return 1
       if (asn == "23764" || is_ctgnet_ip(ip)) return !is_ctgnet_transit_ip(ip)
       if (asn == "58807" || asn == "58453" || asn == "9808") return 1
       if (asn ~ /^5604[0-8]$/) return 1
@@ -1780,11 +2168,10 @@ route_label_from_ip_trace() {
       return 0
     }
     function label_from_mainland_hop(hop, asn, ip,   h) {
-      if (asn == "10099") return "10099"
+      if (is_10099_hop(asn, ip)) return "10099"
       if (asn == "9929") return "9929"
       if (asn == "4837" || asn == "4808") return "4837"
-      if (asn == "4134" && is_163_ip(ip)) return "163"
-      if (asn == "4847" || is_163_ip(ip)) return "163"
+      if (asn == "4134" || asn == "4847" || is_163_ip(ip)) return "163"
       if (target_isp == "电信" && (is_telecom_access_asn(asn) || is_telecom_access_ip(ip))) return "163"
       if (asn == "23764" || is_ctgnet_ip(ip)) return ""
       if (asn == "4809") {
@@ -1909,6 +2296,192 @@ route_label_from_ip_trace() {
   ' "$asn_map_file" "$trace_ip_file" "$trace_file"
 }
 
+education_route_label_from_ip_trace() {
+  local trace_file="$1" asn_map_file="$2" trace_ip_file="$3" family="$4"
+  local fallback label
+  fallback=$(route_label_from_ip_trace "$trace_file" "$asn_map_file" "$trace_ip_file" "教育网")
+  label=$(awk -F'|' -v family="$family" '
+    function infer_education_asn(ip) {
+      if (ip ~ /^59\.64\./ || ip ~ /^101\.4\./ || ip ~ /^101\.6\./ || ip ~ /^101\.76\./ || ip ~ /^111\.114\./ || ip ~ /^113\.54\./ || ip ~ /^115\.24\./ || ip ~ /^115\.156\./ || ip ~ /^183\.172\./ || ip ~ /^202\.38\.19/ || ip ~ /^202\.112\./ || ip ~ /^202\.113\./ || ip ~ /^202\.114\./ || ip ~ /^202\.115\./ || ip ~ /^202\.116\./ || ip ~ /^202\.117\./ || ip ~ /^202\.118\./ || ip ~ /^202\.119\./ || ip ~ /^202\.120\./ || ip ~ /^202\.194\./ || ip ~ /^202\.196\./ || ip ~ /^202\.197\./ || ip ~ /^202\.198\./ || ip ~ /^202\.200\./ || ip ~ /^202\.201\./ || ip ~ /^202\.202\./ || ip ~ /^202\.207\./ || ip ~ /^210\.2[6-9]\./ || ip ~ /^210\.3[0-9]\./ || ip ~ /^210\.4[0-7]\./ || ip ~ /^219\.22[4-9]\./ || ip ~ /^222\.(1[6-9]|2[0-3])\./ || ip ~ /^222\.19[2-9]\./ || ip ~ /^222\.20[0-7]\./) return "4538"
+      if (ip ~ /^2001:252:/) return "23911"
+      if (ip ~ /^2001:da8:/ || ip ~ /^2001:250:/ || ip ~ /^2402:f000:/) return "23910"
+      return ""
+    }
+    function infer_route_asn(ip,   asn) {
+      asn = infer_education_asn(ip)
+      if (asn != "") return asn
+      if (ip ~ /^59\.43\./) return "4809"
+      if (ip ~ /^203\.22\.182\./ || ip ~ /^203\.22\.(178|179)\./ || ip ~ /^203\.128\.224\./ || ip ~ /^69\.194\./ || ip ~ /^2400:9380:/) return "23764"
+      if (ip ~ /^202\.97\./ || ip ~ /^202\.96\./ || ip ~ /^219\.141\./ || ip ~ /^219\.142\./ || ip ~ /^106\.37\./ || ip ~ /^240e:/) return "4134"
+      if (ip ~ /^219\.158\./ || (ip ~ /^2408:/ && ip !~ /^2408:8120:/)) return "4837"
+      if (ip ~ /^223\.120\./ || ip ~ /^223\.119\./) return "58453"
+      if (ip ~ /^221\.183\./ || ip ~ /^111\.24\./ || ip ~ /^111\.13\./ || ip ~ /^2409:8080:/) return "9808"
+      if (ip ~ /^2402:4f00:f000:/) return "58807"
+      if (ip ~ /^2401:3cc0:/) return "7578"
+      if (ip ~ /^103\.214\./ || ip ~ /^103\.228\.68\./ || ip ~ /^103\.239\.176\./ || ip ~ /^118\.26\.151\./ || ip ~ /^162\.219\.(3[2-9]|85)\./ || ip ~ /^162\.245\.124\./ || ip ~ /^202\.77\.23\./ || ip ~ /^203\.160\.(66|75)\./ || ip ~ /^2401:8a00:/) return "10099"
+      if (ip ~ /^210\.14\./ || ip ~ /^210\.51\./ || ip ~ /^210\.78\./ || ip ~ /^218\.105\./ || ip ~ /^2408:8120:/) return "9929"
+      return ""
+    }
+    function is_education_asn(asn, owner, lower_owner) {
+      lower_owner = tolower(owner)
+      return asn == "4538" || asn == "23910" || asn == "23911" || asn == "24350" || lower_owner ~ /cernet/
+    }
+    function is_education_hop(asn, owner, ip) {
+      return is_education_asn(asn, owner) || infer_education_asn(ip) != ""
+    }
+    function is_hkix_ip(ip) {
+      return ip ~ /^123\.255\.(8[8-9]|9[0-5])\./ || ip ~ /^2001:7fa:/
+    }
+    function is_he_exchange_ip(ip) {
+      return ip == "2001:504:13::210:122"
+    }
+    function is_ctggia_ip(ip) {
+      return ip ~ /^59\.43\./
+    }
+    function is_ctggia_hop(asn, owner, ip, lower_owner) {
+      lower_owner = tolower(owner)
+      return asn == "23764" || is_ctggia_ip(ip) || lower_owner ~ /china telecom global|ctgnet|ctg[- ]/
+    }
+    function compact_owner(owner,   value, words, count, i, result, candidate) {
+      value = owner
+      sub(/[[:space:]]+-[[:space:]].*$/, "", value)
+      gsub(/,/, "", value)
+      gsub(/[[:space:]]+(Limited|Ltd\.?|Inc\.?|LLC|Corporation|Corp\.?|Company|Co\.?)$/, "", value)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      if (length(value) <= 9) return value
+      count = split(value, words, /[[:space:]]+/)
+      for (i = 1; i <= count; i++) {
+        candidate = result (result == "" ? "" : " ") words[i]
+        if (length(candidate) > 9) break
+        result = candidate
+      }
+      return result != "" ? result : substr(value, 1, 9)
+    }
+    function is_generic_owner_label(label, lower_label) {
+      lower_label = tolower(label)
+      return lower_label == "global" || lower_label == "network" || lower_label == "networks" || lower_label == "internet" || lower_label == "communications" || lower_label == "telecom"
+    }
+    function transit_label(asn, owner, ip,   lower_owner, label) {
+      if (is_hkix_ip(ip)) return "HKIX"
+      if (is_he_exchange_ip(ip)) return "HE"
+      if (is_ctggia_hop(asn, owner, ip)) return "CTGGIA"
+      if (asn == "4134") return "163"
+      if (asn == "4837") return "4837"
+      if (asn == "58807") return "CMIN2"
+      if (asn == "10099") return "10099"
+      if (asn == "9929") return "9929"
+      if (asn == "58453" || asn == "9808" || asn ~ /^5604[0-8]$/) return "CMI"
+      if (asn == "7578" || asn == "137409") return "GSL"
+      lower_owner = tolower(owner)
+      if (lower_owner ~ /chinanet[- ]backbone/) return "163"
+      if (lower_owner ~ /china169[- ]backbone/) return "4837"
+      if (lower_owner ~ /china unicom industrial internet|cuii/) return "9929"
+      if (lower_owner ~ /china mobile international|cmi-int/) return "CMI"
+      if (lower_owner ~ /global secure layer/) return "GSL"
+      if (asn == "6939" || lower_owner ~ /hurricane electric/) return "HE"
+      if (lower_owner ~ /ntt/) return "NTT"
+      if (lower_owner ~ /arelion|twelve99|telia carrier/) return "Arelion"
+      if (lower_owner ~ /cogent/) return "Cogent"
+      if (lower_owner ~ /tata communications/) return "Tata"
+      label = compact_owner(owner)
+      if (is_generic_owner_label(label)) return asn != "" ? "AS" asn : ""
+      return label != "" ? label : (asn != "" ? "AS" asn : "")
+    }
+    function domestic_label(asn, owner, ip,   lower_owner) {
+      lower_owner = tolower(owner)
+      if (asn == "4134" || ip ~ /^202\.97\./ || ip ~ /^202\.96\./ || ip ~ /^219\.141\./ || ip ~ /^219\.142\./ || ip ~ /^106\.37\./ || ip ~ /^240e:/ || lower_owner ~ /chinanet[- ]backbone/) return "163"
+      if (asn == "9929" || ip ~ /^210\.14\./ || ip ~ /^210\.51\./ || ip ~ /^210\.78\./ || ip ~ /^218\.105\./ || ip ~ /^2408:8120:/ || lower_owner ~ /china unicom industrial internet|cuii/) return "9929"
+      if (asn == "4837" || ip ~ /^219\.158\./ || (ip ~ /^2408:/ && ip !~ /^2408:8120:/) || lower_owner ~ /china169[- ]backbone/) return "4837"
+      return ""
+    }
+    function is_international_label(label) {
+      return label == "CTGGIA" || label == "10099" || label == "CMI" || label == "CMIN2" || label == "HE" || label == "GSL" || label == "NTT" || label == "Arelion" || label == "Cogent" || label == "Tata"
+    }
+    FILENAME == ARGV[1] {
+      asn_by_ip[tolower($1)] = $2
+      owner_by_ip[tolower($1)] = $3
+      next
+    }
+    FILENAME == ARGV[2] {
+      ip = tolower($0)
+      if (seen[ip]++) next
+      hop++
+      ips[hop] = ip
+      asns[hop] = asn_by_ip[ip]
+      owners[hop] = owner_by_ip[ip]
+      if (asns[hop] == "") asns[hop] = infer_route_asn(ip)
+      next
+    }
+    END {
+      first_education = 0
+      for (h = 1; h <= hop; h++) {
+        if (is_education_hop(asns[h], owners[h], ips[h])) {
+          first_education = h
+          break
+        }
+      }
+      if (first_education == 0) exit
+      for (h = 1; h < first_education; h++) {
+        if (is_hkix_ip(ips[h]) && first_hkix == 0) first_hkix = h
+        candidate = transit_label(asns[h], owners[h], ips[h])
+        if (is_international_label(candidate)) {
+          if (first_international == "") first_international = candidate
+          if (candidate == "CMIN2") {
+            seen_cmin2 = 1
+            international = candidate
+          } else if (candidate == "CMI" && seen_cmin2) {
+            international = "CMIN2->CMI"
+          } else {
+            international = candidate
+          }
+          last_international = h
+        }
+      }
+      if (first_hkix > 0) {
+        for (h = first_hkix - 1; h >= 1; h--) {
+          candidate = transit_label(asns[h], owners[h], ips[h])
+          if (candidate == "" || candidate == "HKIX" || candidate == "163" || candidate == "4837" || candidate == "9929") continue
+          if (is_international_label(candidate)) {
+            upstream = candidate
+            break
+          }
+          if (fallback_upstream == "") fallback_upstream = candidate
+        }
+        if (upstream == "") upstream = fallback_upstream
+        print (upstream != "" ? upstream "->HKIX" : "HKIX")
+        exit
+      }
+      if (last_international > 0) {
+        for (h = last_international + 1; h < first_education; h++) {
+          domestic = domestic_label(asns[h], owners[h], ips[h])
+          if (domestic != "") {
+            first_domestic = domestic
+            break
+          }
+        }
+        if (first_domestic != "") {
+          print (international !~ /->/ ? international "->" first_domestic : international)
+        } else if (international ~ /->/) {
+          print international
+        } else if (first_international != "" && first_international != international) {
+          print first_international "->" international
+        } else {
+          print international
+        }
+        exit
+      }
+      for (h = first_education - 1; h >= 1; h--) {
+        if (is_education_hop(asns[h], owners[h], ips[h])) continue
+        transit = transit_label(asns[h], owners[h], ips[h])
+        if (transit != "") break
+      }
+      if (transit == "") transit = "Hidden"
+      print transit
+    }
+  ' "$asn_map_file" "$trace_ip_file")
+  printf '%s' "${label:-$fallback}"
+}
+
 route_trace_one() {
   local family="$1" protocol="$2" prov="$3" isp="$4" host="$5" idx="$6" port="${7:-80}" fixed_ip="${8:-}" prefix="${9:-route}"
   local packet_length="${10:-44}"
@@ -2004,7 +2577,7 @@ show_route_results() {
       proto = toupper($4)
       label = $6
       if (status == "LIMIT") label = "LIMIT"
-      if (status == "FAIL") label = label == "" ? "FAIL" : label
+      if (status == "FAIL") label = "failed"
       if (!(proto in proto_seen)) {
         proto_seen[proto] = 1
         proto_order[++pn] = proto
@@ -2257,13 +2830,14 @@ collect_education_route_labels() {
   if [ -s "$ip_file" ]; then
     query_cymru_asn "$ip_file" "$cymru_file"
     build_asn_map "$cymru_file" "$asn_map_file"
+    append_server_asn_meta "$ip_file" "$asn_map_file"
   fi
 
   while IFS='|' read -r status prov isp protocol host value; do
     if [ "$status" = "TRACE" ] && [ -f "${RESULT_DIR}/${prefix}_trace_${value}" ]; then
       trace_ip_file="${RESULT_DIR}/${prefix}_trace_${value}.ips"
       extract_trace_ips "${RESULT_DIR}/${prefix}_trace_${value}" > "$trace_ip_file"
-      label=$(route_label_from_ip_trace "${RESULT_DIR}/${prefix}_trace_${value}" "$asn_map_file" "$trace_ip_file" "$isp")
+      label=$(education_route_label_from_ip_trace "${RESULT_DIR}/${prefix}_trace_${value}" "$asn_map_file" "$trace_ip_file" "$family")
       echo "OK|$prov|$isp|tcp|$host|$label" >> "$out_file"
     elif [ -n "$status" ]; then
       echo "$status|$prov|$isp|tcp|$host|${value:-Hidden}" >> "$out_file"
@@ -2457,7 +3031,10 @@ probe_target() {
     fi
   fi
   for ((i = 1; i <= PACKETS; i++)); do
-    if [ -n "$PACKET_SIZE_OVERRIDE" ]; then
+    if [ "$group" = "cdn4" ] || [ "$group" = "cdn6" ] ||
+       [ "$group" = "cernet" ] || [ "$group" = "cernet2" ]; then
+      packet_size="$header_size"
+    elif [ -n "$PACKET_SIZE_OVERRIDE" ]; then
       packet_size="$PACKET_SIZE_OVERRIDE"
     elif [ "$large_packet_mode" -eq 1 ]; then
       remaining=$((PACKETS - i + 1))
@@ -2645,7 +3222,7 @@ large_packet_precheck() {
   result=$(probe_target "largepre" 4 "Cloudflare" "预检" "$LARGE_PACKET_PRECHECK_DOMAIN" "$ip" 443 0 precheck)
   IFS='|' read -r status _prov _isp _host _ip sent rcv loss lat <<< "$result"
   LARGE_PACKET_PRECHECK_LOSS="${loss:-100.00}"
-  if [ "$status" != "OK" ] || awk -v loss="${loss:-100}" 'BEGIN { exit !(loss + 0 >= 100) }'; then
+  if [ "$status" != "OK" ] || awk -v loss="${loss:-100}" 'BEGIN { exit !(loss + 0 >= 80) }'; then
     LARGE_PACKET_FIREWALL_LIMITED=1
     return 1
   fi
@@ -2700,33 +3277,114 @@ international_task_count() {
   printf '%s' "$((${#INTERNATIONAL_SITE_TARGETS[@]} + ${#INTERNATIONAL_CDN_TARGETS[@]}))"
 }
 
-resolve_first_public_ipv4() {
-  local domain="$1" ip
+international_latency_families() {
+  if [ "$ONLY_IPV4" -eq 1 ] && [ "$ONLY_IPV6" -eq 0 ]; then
+    printf '4\n'
+  elif [ "$ONLY_IPV6" -eq 1 ] && [ "$ONLY_IPV4" -eq 0 ]; then
+    printf '6\n'
+  else
+    printf '4\n6\n'
+  fi
+}
+
+international_latency_family_count() {
+  if [ "$ONLY_IPV4" -eq 1 ] && [ "$ONLY_IPV6" -eq 0 ]; then
+    printf '1'
+  elif [ "$ONLY_IPV6" -eq 1 ] && [ "$ONLY_IPV4" -eq 0 ]; then
+    printf '1'
+  else
+    printf '2'
+  fi
+}
+
+international_latency_direction_count() {
+  printf '2'
+}
+
+international_latency_task_count() {
+  printf '%s' "$((${#INTERNATIONAL_IPERF_TARGETS[@]} * $(international_latency_family_count) * $(international_latency_direction_count)))"
+}
+
+international_total_task_count() {
+  printf '%s' "$(($(international_task_count) + $(international_latency_task_count)))"
+}
+
+tcp_info_rtt_ms() {
+  local ip="$1" port="$2"
+  command -v ss >/dev/null 2>&1 || return 1
+  ss -tinp 2>/dev/null | awk -v ip="$ip" -v port="$port" '
+    function is_remote(line) {
+      return index(line, ip ":" port) || index(line, "[" ip "]:" port)
+    }
+    is_remote($0) {
+      matched = 1
+      next
+    }
+    matched && $0 ~ /^[[:space:]]/ && $0 ~ /rtt:/ {
+      start = index($0, " rtt:")
+      if (start == 0) next
+      value = substr($0, start + 5)
+      sub(/\/.*$/, "", value)
+      if (value ~ /^[0-9]+([.][0-9]+)?$/) {
+        last = value
+        if ($0 ~ /bytes_received:[1-9][0-9][0-9]+/) {
+          print value
+          found = 1
+          exit
+        }
+      }
+      next
+    }
+    matched && $0 !~ /^[[:space:]]/ {
+      matched = 0
+    }
+    END {
+      if (!found && last != "") print last
+    }
+  '
+}
+
+emit_public_ipv4s() {
+  local answers="$1" ip found=0
+  while read -r ip; do
+    [ -n "$ip" ] || continue
+    if is_public_ipv4 "$ip"; then
+      printf '%s\n' "$ip"
+      found=1
+    fi
+  done <<< "$answers"
+  [ "$found" -eq 1 ]
+}
+
+resolve_public_ipv4s() {
+  local domain="$1" answers=""
   if command -v getent >/dev/null 2>&1; then
-    while read -r ip _; do
-      if is_public_ipv4 "$ip"; then
-        printf '%s' "$ip"
-        return 0
-      fi
-    done < <(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1, $2}' | awk '!seen[$1]++')
+    answers=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | awk '!seen[$1]++' || true)
+    if [ -n "$answers" ] && emit_public_ipv4s "$answers"; then
+      return 0
+    fi
+    answers=""
   fi
   if command -v dig >/dev/null 2>&1; then
-    while read -r ip; do
-      if is_public_ipv4 "$ip"; then
-        printf '%s' "$ip"
-        return 0
-      fi
-    done < <(dig +time=3 +tries=1 +short A "$domain" 2>/dev/null)
+    answers=$(dig +time=3 +tries=1 +short A "$domain" 2>/dev/null | awk '!seen[$1]++' || true)
+    if [ -n "$answers" ] && emit_public_ipv4s "$answers"; then
+      return 0
+    fi
+    answers=""
   fi
   if command -v host >/dev/null 2>&1; then
-    while read -r ip; do
-      if is_public_ipv4 "$ip"; then
-        printf '%s' "$ip"
-        return 0
-      fi
-    done < <(host -t A "$domain" 2>/dev/null | awk '/has address/ {print $NF}')
+    answers=$(host -t A "$domain" 2>/dev/null | awk '/has address/ {print $NF}' | awk '!seen[$1]++' || true)
+    if [ -n "$answers" ] && emit_public_ipv4s "$answers"; then
+      return 0
+    fi
   fi
   return 1
+}
+
+resolve_first_public_ipv4() {
+  local ip
+  ip=$(resolve_public_ipv4s "$1" | head -1)
+  [ -n "$ip" ] && printf '%s' "$ip"
 }
 
 resolve_first_public_ipv6() {
@@ -2758,54 +3416,326 @@ resolve_first_public_ipv6() {
   return 1
 }
 
+international_http_probe() {
+  local domain="$1" ip="$2" path="${3:-}" headers http_status edge cache
+  [ -n "$path" ] || { printf -- '-|-|-\n'; return 0; }
+  [[ "$path" == /* ]] || path="/$path"
+  headers=$(curl -4 -sS -I -L \
+    --connect-timeout 3 --max-time "$INTERNATIONAL_HTTP_TIMEOUT" \
+    --resolve "${domain}:443:${ip}" \
+    -A 'TcpQuality/1.0' \
+    "https://${domain}${path}" 2>/dev/null | tr -d '\r' || true)
+  if [ -z "$headers" ]; then
+    printf -- '-|-|-\n'
+    return 0
+  fi
+
+  http_status=$(printf '%s\n' "$headers" | awk '
+    toupper($1) ~ /^HTTP\/[0-9.]+$/ { code = $2 }
+    END { print code }
+  ')
+  [ -n "$http_status" ] || http_status="-"
+  edge=$(printf '%s\n' "$headers" | awk '
+    {
+      key = tolower($1); sub(/:$/, "", key)
+      if (key == "cf-ray") { value = $2; sub(/.*-/, "", value); print "CF:" value; exit }
+      if (key == "x-amz-cf-pop") { print "CloudFront:" $2; exit }
+      if (key == "x-served-by") { print "Fastly"; exit }
+    }
+  ')
+  [ -n "$edge" ] || edge="-"
+  cache=$(printf '%s\n' "$headers" | awk '
+    {
+      key = tolower($1); sub(/:$/, "", key)
+      if (key == "cf-cache-status" || key == "x-cache-status" || key == "x-cache") {
+        print $2; exit
+      }
+    }
+  ')
+  [ -n "$cache" ] || cache="-"
+  printf '%s|%s|%s\n' "$http_status" "$edge" "$cache"
+}
+
 international_test_one() {
-  local idx="$1" category="$2" name="$3" domain="$4" ip result status _prov _isp _host _ip sent rcv loss lat
-  local outfile="${RESULT_DIR}/internet_${idx}"
+  local idx="$1" category="$2" name="$3" provider="$4" domain="$5" path="${6:-}"
+  local outfile="${RESULT_DIR}/internet_${idx}" result status _prov _isp _host _ip sent rcv loss lat
   local PACKETS="$INTERNATIONAL_PACKETS"
-  ip=$(resolve_first_public_ipv4 "$domain" || true)
-  if [ -z "$ip" ]; then
+  local -a candidates=()
+  local ip i selected_ip="" selected_success=0 candidate_count=0 limit=0
+  local total_sent=0 total_rcv=0 rtt_sum="0" aggregate_loss aggregate_rtt
+  local http_status="-" edge="-" cache="-"
+
+  while read -r ip; do
+    [ -n "$ip" ] && candidates+=("$ip")
+  done < <(resolve_public_ipv4s "$domain" || true)
+  candidate_count=${#candidates[@]}
+  if [ "$DEBUG_MODE" -eq 1 ]; then
+    printf '%s\n' "${candidates[@]}" > "${outfile}.ips"
+  fi
+
+  if [ "$candidate_count" -eq 0 ]; then
     printf 'FAIL|%s|%s|%s||0|0|100.00|-1\n' "$category" "$name" "$domain" > "$outfile"
     return
   fi
-  result=$(probe_target "internet" 4 "$name" "$category" "$domain" "$ip" 443 "$idx" main)
-  IFS='|' read -r status _prov _isp _host _ip sent rcv loss lat <<< "$result"
-  if [ "$status" = "OK" ] && [ "${rcv:-0}" -gt 0 ] 2>/dev/null; then
-    printf 'OK|%s|%s|%s|%s|%s|%s|%s|%s\n' "$category" "$name" "$domain" "$ip" "$sent" "$rcv" "$loss" "$lat" > "$outfile"
+
+  limit="$INTERNATIONAL_MAX_IPS"
+  [ "$limit" -gt "$candidate_count" ] && limit="$candidate_count"
+  for ((i = 0; i < limit; i++)); do
+    ip="${candidates[$i]}"
+    result=$(probe_target "internet" 4 "$name" "$category" "$domain" "$ip" 443 "$idx" "${provider}-${i}")
+    IFS='|' read -r status _prov _isp _host _ip sent rcv loss lat <<< "$result"
+    if [[ "$sent" =~ ^[0-9]+$ ]]; then
+      total_sent=$((total_sent + sent))
+    fi
+    if [[ "$rcv" =~ ^[0-9]+$ ]]; then
+      total_rcv=$((total_rcv + rcv))
+    fi
+    if [[ "$rcv" =~ ^[0-9]+$ ]] && [ "$rcv" -gt 0 ] && [[ "$lat" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+      rtt_sum=$(awk -v a="$rtt_sum" -v b="$lat" -v n="$rcv" 'BEGIN { printf "%.6f", a + b * n }')
+      if [ "$selected_success" -eq 0 ]; then
+        selected_ip="$ip"
+        selected_success=1
+      fi
+    elif [ -z "$selected_ip" ]; then
+      selected_ip="$ip"
+    fi
+  done
+
+  aggregate_loss=$(awk -v sent="$total_sent" -v rcv="$total_rcv" 'BEGIN {
+    if (sent == 0) print "100.00";
+    else printf "%.2f", (sent - rcv) * 100 / sent;
+  }')
+  if [ "$total_rcv" -gt 0 ]; then
+    aggregate_rtt=$(awk -v sum="$rtt_sum" -v rcv="$total_rcv" 'BEGIN { printf "%.3f", sum / rcv }')
   else
-    printf 'FAIL|%s|%s|%s|%s|%s|%s|%s|-1\n' "$category" "$name" "$domain" "$ip" "${sent:-0}" "${rcv:-0}" "${loss:-100.00}" > "$outfile"
+    aggregate_rtt=0
   fi
+
+  if [ "$selected_success" -eq 1 ] && [ -n "$path" ]; then
+    IFS='|' read -r http_status edge cache <<< "$(international_http_probe "$domain" "$selected_ip" "$path")"
+  fi
+  if [ "$DEBUG_MODE" -eq 1 ]; then
+    printf 'provider=%s\ndomain=%s\npath=%s\nip=%s\nhttp_status=%s\nedge=%s\ncache=%s\n' \
+      "$provider" "$domain" "${path:-/}" "$selected_ip" "$http_status" "$edge" "$cache" \
+      > "${outfile}.http"
+  fi
+  if [ "$total_rcv" -eq 0 ]; then
+    printf 'FAIL|%s|%s|%s|%s|%s|0|%s|-1\n' \
+      "$category" "$name" "$domain" "$selected_ip" "$total_sent" "$aggregate_loss" \
+      > "$outfile"
+    return
+  fi
+  printf 'OK|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    "$category" "$name" "$domain" "$selected_ip" "$total_sent" "$total_rcv" "$aggregate_loss" "$aggregate_rtt" \
+    > "$outfile"
+}
+
+international_latency_test_one() {
+  local idx="$1" family="$2" direction="$3" row_key="$4" region="$5" label="$6" host="$7" base_port="${8:-5201}" v6_base_port="${9:-}"
+  local fallback_host="${10:-}" fallback_base_port="${11:-}"
+  local fallback_v6_host="${12:-}" fallback_v6_base_port="${13:-}"
+  local outfile="${RESULT_DIR}/international_latency_${family}_${direction}_${idx}"
+  local ip="" port="" json err_file rtt_us tcp_rtt_ms latency="-" retransmits="-" candidate_retransmits="" status="FAIL"
+  local first_port last_port attempt=0 error_reason="" iperf_pid
+  local -a iperf_direction_args=()
+
+  [[ "$base_port" =~ ^[0-9]+$ ]] || base_port=5201
+  if [ "$direction" = "download" ]; then
+    iperf_direction_args=(-R)
+  else
+    direction="upload"
+  fi
+
+  if [ "$family" = "4" ]; then
+    if is_public_ipv4 "$host"; then
+      ip="$host"
+    else
+      ip=$(resolve_first_public_ipv4 "$host" || true)
+    fi
+  else
+    ip=$(resolve_first_public_ipv6 "$host" || true)
+  fi
+  if [ -z "$ip" ]; then
+    if [ "$family" = "4" ] && [ -n "$fallback_host" ]; then
+      international_latency_test_one "$idx" "$family" "$direction" "$row_key" "$region" "$label" "$fallback_host" "${fallback_base_port:-5201}"
+      return
+    fi
+    if [ "$family" = "6" ] && [ -n "$fallback_v6_host" ]; then
+      international_latency_test_one "$idx" "$family" "$direction" "$row_key" "$region" "$label" "$fallback_v6_host" "$base_port" "$fallback_v6_base_port"
+      return
+    fi
+    printf 'SKIP|%s|%s|%s|%s|%s|%s||-|-\n' "$family" "$direction" "$row_key" "$region" "$label" "$host" > "$outfile"
+    if [ "$DEBUG_MODE" -eq 1 ]; then
+      printf 'status=SKIP\nreason=no-public-%s\n' "${family}" > "${outfile}.debug"
+    fi
+    return
+  fi
+
+  # Leaseweb 每个端口只允许一个连接。IPv4/IPv6 使用互不重叠的端口池，
+  # 每个节点/协议/方向最多尝试 10 次，循环使用同一协议的 5 个端口，任意一次成功即停止。
+  if [ "$family" = "4" ]; then
+    first_port="$base_port"
+  else
+    if [[ "$v6_base_port" =~ ^[0-9]+$ ]]; then
+      first_port="$v6_base_port"
+    else
+      first_port=$((base_port + 5))
+    fi
+  fi
+  last_port=$((first_port + 4))
+  attempt=0
+  while [ "$attempt" -lt "$INTERNATIONAL_IPERF_MAX_ATTEMPTS" ]; do
+    attempt=$((attempt + 1))
+    port=$((first_port + ( (attempt - 1) % 5 )))
+    json=$(mktemp "${RESULT_DIR}/iperf3.XXXXXX.json")
+    err_file="${json}.err"
+    tcp_rtt_ms=""
+    candidate_retransmits=""
+    if [ "${direction}" = "download" ] && command -v ss >/dev/null 2>&1; then
+      if command -v timeout >/dev/null 2>&1; then
+        timeout 15 iperf3 "-${family}" "${iperf_direction_args[@]}" -c "$ip" -p "$port" \
+          -t "$INTERNATIONAL_IPERF_SECONDS" -b "$INTERNATIONAL_IPERF_RATE" \
+          -J --connect-timeout "$INTERNATIONAL_IPERF_CONNECT_TIMEOUT_MS" \
+          > "$json" 2> "$err_file" &
+      else
+        iperf3 "-${family}" "${iperf_direction_args[@]}" -c "$ip" -p "$port" \
+          -t "$INTERNATIONAL_IPERF_SECONDS" -b "$INTERNATIONAL_IPERF_RATE" \
+          -J --connect-timeout "$INTERNATIONAL_IPERF_CONNECT_TIMEOUT_MS" \
+          > "$json" 2> "$err_file" &
+      fi
+      iperf_pid=$!
+      while kill -0 "${iperf_pid}" 2>/dev/null; do
+        tcp_rtt_ms=$(tcp_info_rtt_ms "$ip" "$port" || true)
+        [[ "${tcp_rtt_ms}" =~ ^[0-9]+([.][0-9]+)?$ ]] || tcp_rtt_ms=""
+        sleep 0.2
+      done
+      wait "${iperf_pid}" || true
+    else
+      if command -v timeout >/dev/null 2>&1; then
+        timeout 15 iperf3 "-${family}" "${iperf_direction_args[@]}" -c "$ip" -p "$port" \
+          -t "$INTERNATIONAL_IPERF_SECONDS" -b "$INTERNATIONAL_IPERF_RATE" \
+          -J --connect-timeout "$INTERNATIONAL_IPERF_CONNECT_TIMEOUT_MS" \
+          > "$json" 2> "$err_file" || true
+      else
+        iperf3 "-${family}" "${iperf_direction_args[@]}" -c "$ip" -p "$port" \
+          -t "$INTERNATIONAL_IPERF_SECONDS" -b "$INTERNATIONAL_IPERF_RATE" \
+          -J --connect-timeout "$INTERNATIONAL_IPERF_CONNECT_TIMEOUT_MS" \
+          > "$json" 2> "$err_file" || true
+      fi
+    fi
+
+    rtt_us=$(jq -r '
+      .end.streams[0].sender.mean_rtt
+      // .end.streams[0].receiver.mean_rtt
+      // .intervals[-1].streams[0].rtt
+      // empty
+    ' "$json" 2>/dev/null || true)
+    candidate_retransmits=$(jq -r '
+      .end.streams[0].sender.retransmits
+      // .end.sum_sent.retransmits
+      // .end.streams[0].receiver.retransmits
+      // empty
+    ' "$json" 2>/dev/null || true)
+    error_reason=$(jq -r '.error // empty' "$json" 2>/dev/null || true)
+    if [ -z "$error_reason" ] && [ -s "$err_file" ]; then
+      error_reason=$(tr '\n' ' ' < "$err_file" | sed 's/[[:space:]][[:space:]]*/ /g' | cut -c1-240)
+    fi
+    if jq -e '(.error? // "") == "" and (((.start.connected // []) | length) > 0)' "$json" >/dev/null 2>&1; then
+      if [[ "$direction" = "download" && "$tcp_rtt_ms" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        latency=$(awk -v ms="$tcp_rtt_ms" 'BEGIN { printf "%.3f", ms }')
+      elif [[ "$rtt_us" =~ ^[0-9]+([.][0-9]+)?$ ]] && [ "$(awk -v us="$rtt_us" 'BEGIN { print (us > 0) ? 1 : 0 }')" -eq 1 ]; then
+        latency=$(awk -v us="$rtt_us" 'BEGIN { printf "%.3f", us / 1000 }')
+      else
+        latency="-"
+      fi
+      if [[ "$latency" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        if [[ "$candidate_retransmits" =~ ^[0-9]+$ ]]; then
+          retransmits="$candidate_retransmits"
+        fi
+        status="OK"
+        rm -f -- "$json" "$err_file"
+        break
+      fi
+      error_reason="${error_reason:-no-rtt}"
+    fi
+    rm -f -- "$json" "$err_file"
+    [ "$attempt" -lt "$INTERNATIONAL_IPERF_MAX_ATTEMPTS" ] || break
+  done
+  if [ "$status" != "OK" ] && [ "$family" = "4" ] && [ -n "$fallback_host" ]; then
+    international_latency_test_one "$idx" "$family" "$direction" "$row_key" "$region" "$label" "$fallback_host" "${fallback_base_port:-5201}"
+    return
+  fi
+  if [ "$status" != "OK" ] && [ "$family" = "6" ] && [ -n "$fallback_v6_host" ]; then
+    international_latency_test_one "$idx" "$family" "$direction" "$row_key" "$region" "$label" "$fallback_v6_host" "$base_port" "$fallback_v6_base_port"
+    return
+  fi
+  if [ "$DEBUG_MODE" -eq 1 ]; then
+    printf 'status=%s\nfamily=IPv%s\ndirection=%s\nhost=%s\nip=%s\nports=%s-%s\nattempts=%s\nrtt_tcp_info_ms=%s\nretransmits=%s\nreason=%s\n' \
+      "$status" "$family" "$direction" "$host" "$ip" "$first_port" "$last_port" "$attempt" "${tcp_rtt_ms:--}" "$retransmits" "${error_reason:--}" \
+      > "${outfile}.debug"
+  fi
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    "$status" "$family" "$direction" "$row_key" "$region" "$label" "$host" "$ip" "$latency" "$retransmits" > "$outfile"
 }
 
 run_international_tests() {
-  local idx=0 launched=0 done entry name domain category running total
-  total=$(international_task_count)
+  local idx=0 launched=0 entry name provider domain path category total latency_expected=0
+  local row_key region label host port v6_port fallback_host fallback_port fallback_v6_host fallback_v6_port family direction
+  local -a latency_families=()
+  mapfile -t latency_families < <(international_latency_families)
+  total=$(international_total_task_count)
   INTERNATIONAL_PROGRESS_TOTAL="$total"
   [ "$total" -gt 0 ] || return 0
+  check_iperf3
+
+  # 每个节点分别执行上传和下载；每个方向内再分别测试 IPv4/IPv6。
+  for direction in upload download; do
+    for family in "${latency_families[@]}"; do
+      idx=0
+      for entry in "${INTERNATIONAL_IPERF_TARGETS[@]}"; do
+        IFS='|' read -r row_key region label host port v6_port fallback_host fallback_port fallback_v6_host fallback_v6_port <<< "$entry"
+        idx=$((idx + 1))
+        while [ $((launched - $(count_international_progress))) -ge "$PARALLEL" ]; do
+          show_progress
+          sleep 0.2
+        done
+        international_latency_test_one "$idx" "$family" "$direction" "$row_key" "$region" "$label" "$host" "$port" "$v6_port" "$fallback_host" "$fallback_port" "$fallback_v6_host" "$fallback_v6_port" &
+        launched=$((launched + 1))
+        show_progress
+      done
+      latency_expected=$((latency_expected + ${#INTERNATIONAL_IPERF_TARGETS[@]}))
+      while [ "$(count_international_progress)" -lt "$latency_expected" ]; do
+        show_progress
+        sleep 0.2
+      done
+    done
+  done
 
   category="网站"
+  # iPerf3 延迟结果使用独立的文件名前缀；网站/CDN 结果必须从 internet_1
+  # 连续编号，否则追加的节点任务会导致后半段 CDN 被展示和上传逻辑跳过。
+  idx=0
   for entry in "${INTERNATIONAL_SITE_TARGETS[@]}"; do
-    name=${entry%%|*}
-    domain=${entry#*|}
+    IFS='|' read -r name domain path <<< "$entry"
     idx=$((idx + 1))
     while [ $((launched - $(count_international_progress))) -ge "$PARALLEL" ]; do
       show_progress
       sleep 0.2
     done
-    international_test_one "$idx" "$category" "$name" "$domain" &
+    international_test_one "$idx" "$category" "$name" "Website" "$domain" "${path:-}" &
     launched=$((launched + 1))
     show_progress
   done
 
   category="CDN"
   for entry in "${INTERNATIONAL_CDN_TARGETS[@]}"; do
-      name=${entry%%|*}
-      domain=${entry#*|}
+      IFS='|' read -r name provider domain path <<< "$entry"
       idx=$((idx + 1))
       while [ $((launched - $(count_international_progress))) -ge "$PARALLEL" ]; do
         show_progress
         sleep 0.2
       done
-      international_test_one "$idx" "$category" "$name" "$domain" &
+      international_test_one "$idx" "$category" "$name" "$provider" "$domain" "${path:-}" &
       launched=$((launched + 1))
       show_progress
   done
@@ -2829,7 +3759,176 @@ append_international_csv() {
   done
 }
 
+append_international_latency_csv() {
+  local csv="$1" entry row_key region label host port v6_port fallback_host fallback_port fallback_v6_host fallback_v6_port family direction f i
+  local status result_family result_direction result_row_key result_region result_label result_host ip lat retrans loss
+  local target_count=${#INTERNATIONAL_IPERF_TARGETS[@]}
+  local -a latency_families=()
+  mapfile -t latency_families < <(international_latency_families)
+
+  for ((i = 1; i <= target_count; i++)); do
+    entry="${INTERNATIONAL_IPERF_TARGETS[i - 1]}"
+    IFS='|' read -r row_key region label host port v6_port fallback_host fallback_port fallback_v6_host fallback_v6_port <<< "$entry"
+    for direction in upload download; do
+      for family in "${latency_families[@]}"; do
+        f="${RESULT_DIR}/international_latency_${family}_${direction}_${i}"
+        [ -f "$f" ] || continue
+        IFS='|' read -r status result_family result_direction result_row_key result_region result_label result_host ip lat retrans < "$f"
+        if [ "$status" = "OK" ]; then loss="0.00"; else loss="100.00"; fi
+        echo "国际互联,IPv${family},${result_label},延迟,${result_host},${ip},${status},0,0,${loss},${lat},iPerf3,${result_region},${result_row_key},,,${retrans:--},${result_direction:-${direction}}" >> "$csv"
+      done
+    done
+  done
+}
+
+show_international_latency_results() {
+  local first_file="${RESULT_DIR}/international_latency_4_upload_1"
+  [ -f "$first_file" ] || first_file="${RESULT_DIR}/international_latency_6_upload_1"
+  [ -f "$first_file" ] || first_file="${RESULT_DIR}/international_latency_4_download_1"
+  [ -f "$first_file" ] || first_file="${RESULT_DIR}/international_latency_6_download_1"
+  [ -f "$first_file" ] || return 0
+  local target_count=${#INTERNATIONAL_IPERF_TARGETS[@]} i family direction f
+  local -a latency_families=()
+  mapfile -t latency_families < <(international_latency_families)
+  {
+    for ((i = 1; i <= target_count; i++)); do
+      for direction in upload download; do
+        for family in "${latency_families[@]}"; do
+          f="${RESULT_DIR}/international_latency_${family}_${direction}_${i}"
+          [ -f "$f" ] && cat "$f"
+        done
+      done
+    done
+  } | awk -F'|' -v green="$GREEN" -v yellow="$YELLOW" -v red="$RED" -v cyan="$CYAN" -v white="$WHITE" -v dim="$DIM" -v bold="$BOLD" -v nc="$NC" '
+  BEGIN {
+    region_w = 8
+    label_w = 18
+    latency_w = 9
+    retrans_w = 8
+  }
+'"$(awk_table_helpers)"'
+  function value(status, latency) {
+    if (status != "OK" || latency !~ /^[0-9]+([.][0-9]+)?$/) return "-"
+    return sprintf("%dms", latency + 0)
+  }
+  function retransmission_value(status, retransmits) {
+    if (status != "OK" || retransmits !~ /^[0-9]+$/) return "-"
+    return sprintf("%d", retransmits + 0)
+  }
+  function latency_color(value_text, numeric) {
+    if (value_text == "-" || value_text == "") return red
+    numeric = value_text
+    sub(/ms$/, "", numeric)
+    if (numeric + 0 > 200) return red
+    if (numeric + 0 > 100) return yellow
+    return green
+  }
+  function colored_latency(value_text) {
+    return latency_color(value_text) pad_left(value_text, latency_w) nc
+  }
+  function retransmission_color(value_text, numeric) {
+    if (value_text == "-" || value_text == "") return red
+    numeric = value_text + 0
+    if (numeric >= 50) return red
+    if (numeric > 10) return yellow
+    return green
+  }
+  function colored_retransmission(value_text) {
+    return retransmission_color(value_text) pad_left(value_text, retrans_w) nc
+  }
+  function metric_header(text, width) {
+    return spaces(width - 8) text
+  }
+  function metric_latency(key, slot, direction, family) {
+    return values[key, slot, direction, family] == "" ? "-" : values[key, slot, direction, family]
+  }
+  function metric_retransmissions(key, slot, direction, family) {
+    return retransmissions[key, slot, direction, family] == "" ? "-" : retransmissions[key, slot, direction, family]
+  }
+  function print_family_row(key, slot, family, show_region, region_text, label_text) {
+    region_text = show_region && key != "americas-latam" ? pad_right(row_region[key], region_w) : pad_right("", region_w)
+    label_text = pad_right(labels[key, slot], label_w)
+    printf "  %s  %s  ", region_text, label_text
+    printf "%s  %s  %s  %s\n", \
+      colored_latency(metric_latency(key, slot, "download", family)), \
+      colored_retransmission(metric_retransmissions(key, slot, "download", family)), \
+      colored_latency(metric_latency(key, slot, "upload", family)), \
+      colored_retransmission(metric_retransmissions(key, slot, "upload", family))
+  }
+  function print_header(family) {
+    printf "  %s%s  %s  ", cyan, \
+      pad_right("区域", region_w), \
+      pad_right(family == 4 ? "节点-IPv4" : "节点-IPv6", label_w)
+    printf "%s  %s  %s  %s%s\n", \
+      metric_header("下载延迟", latency_w), \
+      metric_header("下载重传", retrans_w), \
+      metric_header("上传延迟", latency_w), \
+      metric_header("上传重传", retrans_w), nc
+  }
+  function print_color_legend() {
+    printf "  %s测试消耗流量<100MB，颜色: %s0-100ms 正常%s  %s101-200ms 一般%s  %s>200ms 较高%s\n\n", dim, green, dim, yellow, dim, red, nc
+  }
+  function print_family_table(family, require_success, r, s, key, has_rows, group_shown, eligible) {
+    has_rows = 0
+    for (r = 1; r <= row_count; r++) {
+      key = row_order[r]
+      for (s = 1; s <= slot_count[key]; s++) {
+        eligible = require_success ? family_success[key, s, family] == 1 : family_seen[key, s, family] == 1
+        if (eligible) has_rows = 1
+      }
+    }
+    if (has_rows == 0) return 0
+    print_header(family)
+    for (r = 1; r <= row_count; r++) {
+      key = row_order[r]
+      group_shown = 0
+      for (s = 1; s <= slot_count[key]; s++) {
+        eligible = require_success ? family_success[key, s, family] == 1 : family_seen[key, s, family] == 1
+        if (!eligible) continue
+        print_family_row(key, s, family, group_shown == 0)
+        group_shown = 1
+      }
+    }
+    return 1
+  }
+  function print_combined_table() {
+    printf "  %s%s%s%s\n", bold, cyan, "国际节点TCP互联测试", nc
+    if (print_family_table(4, 0)) printf "\n"
+    print_family_table(6, 1)
+    print_color_legend()
+  }
+  {
+    status = $1
+    family = $2
+    direction = ($3 == "download" || $3 == "upload") ? $3 : "upload"
+    row_key = $4
+    region = $5
+    label = $6
+    target_key = row_key SUBSEP label
+    if (!(row_key in row_seen)) {
+      row_order[++row_count] = row_key
+      row_seen[row_key] = 1
+      row_region[row_key] = region
+    }
+    if (!(target_key in target_seen)) {
+      target_seen[target_key] = 1
+      slot_count[row_key]++
+      slot[row_key, label] = slot_count[row_key]
+      labels[row_key, slot_count[row_key]] = label
+    }
+    s = slot[row_key, label]
+    values[row_key, s, direction, family] = value(status, $9)
+    retransmissions[row_key, s, direction, family] = retransmission_value(status, $10)
+    family_seen[row_key, s, family] = 1
+    if (status == "OK" && $9 ~ /^[0-9]+([.][0-9]+)?$/) family_success[row_key, s, family] = 1
+  }
+  END {
+    print_combined_table()
+  }'
+}
+
 show_international_results() {
+  show_international_latency_results
   local file_list=("$RESULT_DIR"/internet_[0-9]*) total i f
   [ -f "${file_list[0]}" ] || return 0
   total=$(international_task_count)
@@ -2854,8 +3953,8 @@ show_international_results() {
       if (v > 2) return yellow
       return green
     }
-    if (v > 150) return red
-    if (v > 50) return yellow
+    if (v > 200) return red
+    if (v > 100) return yellow
     return green
   }
   function loss_color(loss, ok) {
@@ -2902,7 +4001,7 @@ show_international_results() {
         split(sites[i], a, SUBSEP)
         row(a[1], a[2], a[3], a[4], a[5], a[6])
       }
-      printf "  %s颜色: %s0-50ms 正常%s  %s50-150ms 一般%s  %s>150ms 异常，或不可达%s\n\n", dim, green, dim, yellow, dim, red, dim
+      printf "  %s颜色: %s0-100ms 正常%s  %s101-200ms 一般%s  %s>200ms 较高%s\n\n", dim, green, dim, yellow, dim, red, nc
     }
     if (cn > 0) {
       header("常用 CDN 国际互联")
@@ -2910,7 +4009,7 @@ show_international_results() {
         split(cdns[i], a, SUBSEP)
         row(a[1], a[2], a[3], a[4], a[5], a[6])
       }
-      printf "  %s颜色: %s0-2ms 正常%s  %s2-10ms 一般%s  %s>10ms 异常，或不可达%s\n\n", dim, green, dim, yellow, dim, red, dim
+      printf "  %s颜色: %s0-2ms 正常%s  %s2-10ms 一般%s  %s>10ms 较高%s\n\n", dim, green, dim, yellow, dim, red, nc
     }
   }'
 }
@@ -2920,7 +4019,7 @@ run_international_mode() {
   require_raw_socket_privilege
   check_curl
   check_nping
-  echo -e "${DIM}  国际互联目标: $(international_task_count)  每目标发包: $INTERNATIONAL_PACKETS  并行: $PARALLEL  端口: 443/tcp${NC}"
+  echo -e "${DIM}  国际互联网站/CDN: $(international_task_count)  延迟方向: ${#INTERNATIONAL_IPERF_TARGETS[@]}×$(international_latency_family_count)×2（上传/下载）  并行: $PARALLEL  端口: 443/tcp、iPerf3 ${INTERNATIONAL_IPERF_RATE}/${INTERNATIONAL_IPERF_SECONDS}s，失败最多重试 ${INTERNATIONAL_IPERF_MAX_ATTEMPTS} 次（目标可单独指定）${NC}"
   echo
   MULTI_PROGRESS_MODE=1
   TOTAL=0
@@ -2931,8 +4030,9 @@ run_international_mode() {
   report_time=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S CST（北京时间）')
   csv="/tmp/zstatic_nping_$(date +%Y%m%d_%H%M%S).csv"
   printf '\xEF\xBB\xBF' > "$csv"
-  echo "网络,IP版本,省份,运营商,域名,IP,状态,发送,收到,丢包率(%),平均延迟ms,线路" >> "$csv"
+  echo "网络,IP版本,省份,运营商,域名,IP,状态,发送,收到,丢包率(%),平均延迟ms,线路,回程连接耗时ms,回程TLS握手耗时ms,去程连接耗时ms,去程TLS握手耗时ms,iPerf3重传次数,iPerf3方向" >> "$csv"
   append_international_csv "$csv"
+  append_international_latency_csv "$csv"
   clear
   print_header
   echo -e "  ${DIM}报告时间：${report_time}${NC}"
@@ -2944,50 +4044,34 @@ run_international_mode() {
   echo
 }
 
-# ===================== 国内分阶段测速 =====================
-SPEEDTEST_RATES=(10 200 unlimited)
-SPEEDTEST_MODE="${SPEEDTEST_MODE:-regions}"
-SPEEDTEST_IFB="ifb_tqtest"
+# ===================== 国内单线程测速 =====================
 SPEEDTEST_IFACE=""
-SPEEDTEST_CREATED_IFB=0
-speedtest_tosutil_url() {
-  local arch tos_arch
-  if [ -n "${TOSUTIL_URL:-}" ]; then
-    printf '%s' "$TOSUTIL_URL"
-    return 0
-  fi
-  arch=$(uname -m 2>/dev/null || printf unknown)
-  case "$arch" in
-    x86_64|amd64) tos_arch=amd64 ;;
-    aarch64|arm64) tos_arch=arm64 ;;
-    *)
-      return 1
-      ;;
-  esac
-  printf 'https://m645b3e1bb36e-mrap.mrap.accesspoint.tos-global.volces.com/linux/%s/tosutil' "$tos_arch"
-}
-
-SPEEDTEST_TOSUTIL_URL="${SPEEDTEST_TOSUTIL_URL:-$(speedtest_tosutil_url || true)}"
-SPEEDTEST_TOSUTIL_BIN="${TOSUTIL_BIN:-}"
-SPEEDTEST_TOS_REGION="${TOS_REGION:-cn-beijing}"
+SPEEDTEST_TOS_REGION="${TOS_REGION:-cn-shanghai}"
 SPEEDTEST_TOS_NETWORK="${TOS_NETWORK:-public}"
-SPEEDTEST_TOS_SIZE="${TOS_PROBE_SIZE:-5GB}"
-SPEEDTEST_TOS_TIMEOUT="${TOS_TIMEOUT:-15}"
-SPEEDTEST_TOS_WARMUP="${TOS_WARMUP:-5}"
-SPEEDTEST_TOS_CT_IP="${TOS_CT_IP:-42.81.80.86}"
-SPEEDTEST_TOS_CU_IP="${TOS_CU_IP:-221.194.175.109}"
-SPEEDTEST_TOS_CM_IP="${TOS_CM_IP:-120.255.0.180}"
+SPEEDTEST_TOS_SIZE="${TOS_PROBE_SIZE:-500MB}"
+SPEEDTEST_TOS_TIMEOUT="${TOS_TIMEOUT:-10}"
+SPEEDTEST_APPLECDN_ENABLED="${SPEEDTEST_APPLECDN_ENABLED:-1}"
+SPEEDTEST_APPLECDN_DOWNLOAD_URL="${SPEEDTEST_APPLECDN_DOWNLOAD_URL:-https://mensura.cdn-apple.com/api/v1/gm/large}"
+SPEEDTEST_APPLECDN_UPLOAD_URL="${SPEEDTEST_APPLECDN_UPLOAD_URL:-https://mensura.cdn-apple.com/api/v1/gm/slurp}"
+SPEEDTEST_APPLECDN_HOST="${SPEEDTEST_APPLECDN_HOST:-mensura.cdn-apple.com}"
+SPEEDTEST_APPLECDN_MAX_MB="${SPEEDTEST_APPLECDN_MAX_MB:-2048}"
+SPEEDTEST_APPLECDN_USER_AGENT="${SPEEDTEST_APPLECDN_USER_AGENT:-networkQuality/194.80.3 CFNetwork/3860.400.51 Darwin/25.3.0}"
+# 不再内置北京测速 fallback；上海远端节点不可用时直接失败，避免误测外省。
+SPEEDTEST_TOS_CT_IP="${TOS_CT_IP:-}"
+SPEEDTEST_TOS_CU_IP="${TOS_CU_IP:-}"
+SPEEDTEST_TOS_CM_IP="${TOS_CM_IP:-}"
+SPEEDTEST_IPV6_PROBE_URL="${SPEEDTEST_IPV6_PROBE_URL:-https://api64.ipify.org}"
+SPEEDTEST_IPV6_CHECKED=0
+SPEEDTEST_IPV6_AVAILABLE=0
 SPEEDTEST_TOS_REMOTE_LOADED=0
-SPEEDTEST_TOS_CT_CITY="北京"
-SPEEDTEST_TOS_CU_CITY="北京"
-SPEEDTEST_TOS_CM_CITY="北京"
-SPEEDTEST_TOS_CT_CANDIDATES="${TOS_CT_IP:-42.81.80.86}|北京|cn-beijing"
-SPEEDTEST_TOS_CU_CANDIDATES="${TOS_CU_IP:-221.194.175.109}|北京|cn-beijing"
-SPEEDTEST_TOS_CM_CANDIDATES="${TOS_CM_IP:-120.255.0.180}|北京|cn-beijing"
-SPEEDTEST_HOSTS_BACKUP=""
-SPEEDTEST_HOSTS_EXISTED=0
-SPEEDTEST_HOSTS_MARK_BEGIN="# tcpquality-tos-speedtest begin"
-SPEEDTEST_HOSTS_MARK_END="# tcpquality-tos-speedtest end"
+SPEEDTEST_APPLECDN6_REMOTE_LOADED=0
+SPEEDTEST_APPLECDN6_NODES=()
+SPEEDTEST_TOS_CT_CITY="上海"
+SPEEDTEST_TOS_CU_CITY="上海"
+SPEEDTEST_TOS_CM_CITY="上海"
+SPEEDTEST_TOS_CT_CANDIDATES="${TOS_CT_IP:+${TOS_CT_IP}|上海|cn-shanghai}"
+SPEEDTEST_TOS_CU_CANDIDATES="${TOS_CU_IP:+${TOS_CU_IP}|上海|cn-shanghai}"
+SPEEDTEST_TOS_CM_CANDIDATES="${TOS_CM_IP:+${TOS_CM_IP}|上海|cn-shanghai}"
 SPEEDTEST_TELECOM_ID=""
 SPEEDTEST_TELECOM_CITY=""
 SPEEDTEST_UNICOM_ID=""
@@ -2995,6 +4079,10 @@ SPEEDTEST_UNICOM_CITY=""
 SPEEDTEST_MOBILE_ID=""
 SPEEDTEST_MOBILE_CITY=""
 SPEEDTEST_ROWS=()
+SPEEDTEST_RANK_ELIGIBLE=1
+SPEEDTEST_RANK_DISABLED_REASON=""
+SPEEDTEST_COUNTER_CHAIN=""
+SPEEDTEST_COUNTER_HOOK=""
 
 speedtest_candidates() {
   case "$1" in
@@ -3011,23 +4099,75 @@ speedtest_candidates() {
 }
 
 speedtest_group_specs() {
-  local rate label
-  if [ "$SPEEDTEST_MODE" = "staged" ]; then
-    for rate in "${SPEEDTEST_RATES[@]}"; do
-      label="${rate}Mbps"
-      [ "$rate" = "unlimited" ] && label="不限"
-      printf '%s|cn-beijing|%s\n' "$label" "$rate"
-    done
-  else
-    printf '%s\n' \
-      "北京|cn-beijing|unlimited" \
-      "上海|cn-shanghai|unlimited" \
-      "广东|cn-guangzhou|unlimited"
-  fi
+  # 单线程测速同样固定上海三网。
+  printf '%s\n' "上海|cn-shanghai|unlimited"
 }
 
 speedtest_group_count() {
   speedtest_group_specs | awk 'NF{count++} END{print count + 0}'
+}
+
+speedtest_applecdn_tests_enabled() {
+  [ "$SPEEDTEST_APPLECDN_ENABLED" = "1" ] || return 1
+  if [[ "$SELECTED_PROVINCES" == *"|北京|"* ||
+        "$SELECTED_PROVINCES" == *"|上海|"* ||
+        "$SELECTED_PROVINCES" == *"|广东|"* ]]; then
+    return 1
+  fi
+  return 0
+}
+
+speedtest_applecdn6_tests_enabled() {
+  speedtest_applecdn_tests_enabled || return 1
+  speedtest_ipv6_available
+}
+
+speedtest_applecdn6_count() {
+  speedtest_applecdn6_tests_enabled || {
+    printf '0'
+    return 0
+  }
+  load_remote_applecdn6_nodes || true
+  printf '%s' "${#SPEEDTEST_APPLECDN6_NODES[@]}"
+}
+
+request_rank_session() {
+  local response_file session_id token started_at expires_at session_ip4
+  RANK_SESSION_ID=""
+  RANK_SESSION_TOKEN=""
+  RANK_SESSION_STARTED_AT=""
+  RANK_SESSION_EXPIRES_AT=""
+  RANK_SESSION_IP4=""
+  command -v curl &>/dev/null || return 1
+
+  response_file=$(mktemp)
+  if ! curl -4 -fsS --connect-timeout 5 --max-time 15 \
+    -H "X-TcpQuality-Public-IPv4: ${IPV4_PUBLIC:-}" \
+    -H "X-TcpQuality-Public-IPv6: ${IPV6_PUBLIC:-}" \
+    -o "$response_file" "$RANK_SESSION_API" >/dev/null 2>&1; then
+    if [ "$DEBUG_MODE" -eq 1 ]; then
+      cp "$response_file" "$RESULT_DIR/rank_session_response.json" 2>/dev/null || true
+    fi
+    rm -f "$response_file"
+    return 1
+  fi
+  if [ "$DEBUG_MODE" -eq 1 ]; then
+    cp "$response_file" "$RESULT_DIR/rank_session_response.json" 2>/dev/null || true
+  fi
+
+  session_id=$(sed -nE 's/.*"sessionId":"([^"]+)".*/\1/p' "$response_file" | head -1)
+  token=$(sed -nE 's/.*"token":"([^"]+)".*/\1/p' "$response_file" | head -1)
+  started_at=$(sed -nE 's/.*"startedAt":"([^"]+)".*/\1/p' "$response_file" | head -1)
+  expires_at=$(sed -nE 's/.*"expiresAt":"([^"]+)".*/\1/p' "$response_file" | head -1)
+  session_ip4=$(sed -nE 's/.*"sessionIp4":"([^"]+)".*/\1/p' "$response_file" | head -1)
+  rm -f "$response_file"
+  [ -n "$session_id" ] && [ -n "$token" ] || return 1
+  RANK_SESSION_ID="$session_id"
+  RANK_SESSION_TOKEN="$token"
+  RANK_SESSION_STARTED_AT="$started_at"
+  RANK_SESSION_EXPIRES_AT="$expires_at"
+  RANK_SESSION_IP4="$session_ip4"
+  return 0
 }
 
 speedtest_region_title() {
@@ -3071,6 +4211,7 @@ load_remote_speedtest_nodes() {
       tos|tosutil|speedtest) ;;
       *) continue ;;
     esac
+    [ "$prov" = "$DOMESTIC_PROVINCE" ] || continue
     region="cn-beijing"
     case "$target" in
       *cn-shanghai*) region="cn-shanghai" ;;
@@ -3110,6 +4251,49 @@ load_remote_speedtest_nodes() {
   return 1
 }
 
+load_remote_applecdn6_nodes() {
+  local tmp url sep line type family prov isp host ip port target backup_host backup_ip backup_port backup_target label
+  local local_index existing existing_label
+  [ "$SPEEDTEST_APPLECDN6_REMOTE_LOADED" -eq 1 ] && return 0
+  command -v curl &>/dev/null || return 1
+
+  tmp=$(mktemp)
+  sep="?"
+  [[ "$GET_NODES_URL" == *"?"* ]] && sep="&"
+  url="${GET_NODES_URL}${sep}format=tsv&scope=apple6"
+  if ! curl -fsSL --connect-timeout 5 --max-time 30 "$url" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  SPEEDTEST_APPLECDN6_NODES=()
+  while IFS= read -r line; do
+    line=${line//$'\t'/'|'}
+    IFS='|' read -r type family prov isp host ip port target backup_host backup_ip backup_port backup_target <<< "$line"
+    [ "$type" = "type" ] && continue
+    [ "$type" = "applecdn" ] || continue
+    [ "$family" = "6" ] || continue
+    [ "$isp" = "移动" ] || continue
+    is_valid_ipv6 "$ip" || continue
+    label="${prov}${isp}"
+    local_index=0
+    for existing in "${SPEEDTEST_APPLECDN6_NODES[@]}"; do
+      existing_label=${existing%%|*}
+      if [ "$existing_label" = "$label" ]; then
+        SPEEDTEST_APPLECDN6_NODES[$local_index]="${existing}|$ip"
+        break
+      fi
+      local_index=$((local_index + 1))
+    done
+    [ "$local_index" -lt "${#SPEEDTEST_APPLECDN6_NODES[@]}" ] || \
+      SPEEDTEST_APPLECDN6_NODES+=("$label|$ip")
+  done < "$tmp"
+  rm -f "$tmp"
+  [ "${#SPEEDTEST_APPLECDN6_NODES[@]}" -gt 0 ] || return 1
+  SPEEDTEST_APPLECDN6_REMOTE_LOADED=1
+  return 0
+}
+
 speedtest_selected_id() {
   case "$1" in
     电信) printf '%s' "$SPEEDTEST_TELECOM_ID" ;;
@@ -3136,17 +4320,7 @@ speedtest_set_selected() {
 }
 
 speedtest_cleanup() {
-  if [ -n "${SPEEDTEST_IFACE:-}" ]; then
-    tc qdisc del dev "$SPEEDTEST_IFACE" root 2>/dev/null || true
-    tc qdisc del dev "$SPEEDTEST_IFACE" ingress 2>/dev/null || true
-  fi
-  tc qdisc del dev "$SPEEDTEST_IFB" root 2>/dev/null || true
-  if [ "${SPEEDTEST_CREATED_IFB:-0}" -eq 1 ]; then
-    ip link set "$SPEEDTEST_IFB" down 2>/dev/null || true
-    ip link delete "$SPEEDTEST_IFB" type ifb 2>/dev/null || true
-    SPEEDTEST_CREATED_IFB=0
-  fi
-  speedtest_restore_hosts
+  speedtest_counter_stop_current
 }
 
 speedtest_dependencies_ready() {
@@ -3154,11 +4328,6 @@ speedtest_dependencies_ready() {
   for cmd in ip nstat awk curl; do
     command -v "$cmd" &>/dev/null || return 1
   done
-  if [ "$SPEEDTEST_MODE" = "staged" ]; then
-    for cmd in tc modprobe; do
-      command -v "$cmd" &>/dev/null || return 1
-    done
-  fi
 }
 
 install_speedtest_dependencies() {
@@ -3170,13 +4339,13 @@ install_speedtest_dependencies() {
   if command -v apt-get &>/dev/null; then
     $USE_SUDO apt-get update -qq >/dev/null 2>&1 || true
     DEBIAN_FRONTEND=noninteractive $USE_SUDO apt-get install -y -qq \
-      iproute2 kmod gawk curl ca-certificates >/dev/null 2>&1
+      iproute2 gawk curl ca-certificates >/dev/null 2>&1
   elif command -v dnf &>/dev/null; then
-    $USE_SUDO dnf install -y -q iproute kmod gawk curl ca-certificates >/dev/null 2>&1
+    $USE_SUDO dnf install -y -q iproute gawk curl ca-certificates >/dev/null 2>&1
   elif command -v yum &>/dev/null; then
-    $USE_SUDO yum install -y -q iproute kmod gawk curl ca-certificates >/dev/null 2>&1
+    $USE_SUDO yum install -y -q iproute gawk curl ca-certificates >/dev/null 2>&1
   elif command -v apk &>/dev/null; then
-    $USE_SUDO apk add --no-cache iproute2 kmod awk curl ca-certificates >/dev/null 2>&1
+    $USE_SUDO apk add --no-cache iproute2 awk curl ca-certificates >/dev/null 2>&1
   else
     return 1
   fi
@@ -3188,67 +4357,27 @@ install_speedtest_dependencies() {
   return 1
 }
 
-install_tosutil_speedtest() {
-  local existing
-  if [ -n "$SPEEDTEST_TOSUTIL_BIN" ] && [ -x "$SPEEDTEST_TOSUTIL_BIN" ]; then
-    if "$SPEEDTEST_TOSUTIL_BIN" version >/dev/null 2>&1; then
-      return 0
-    fi
-  fi
-  if command -v tosutil &>/dev/null; then
-    existing=$(command -v tosutil)
-    if "$existing" version >/dev/null 2>&1; then
-      SPEEDTEST_TOSUTIL_BIN="$existing"
-      return 0
-    fi
-  fi
-  if [ -x ./tosutil ]; then
-    if ./tosutil version >/dev/null 2>&1; then
-      SPEEDTEST_TOSUTIL_BIN="./tosutil"
-      return 0
-    fi
-  fi
-  [ -n "$SPEEDTEST_TOSUTIL_URL" ] || return 1
-  show_dependency_install_notice
-  $USE_SUDO curl -fL -o /usr/local/bin/tosutil "$SPEEDTEST_TOSUTIL_URL" >/dev/null 2>&1 || {
-    clear_dependency_install_notice
-    return 1
-  }
-  $USE_SUDO chmod +x /usr/local/bin/tosutil >/dev/null 2>&1 || {
-    clear_dependency_install_notice
-    return 1
-  }
-  if ! /usr/local/bin/tosutil version >/dev/null 2>&1; then
-    clear_dependency_install_notice
+install_speedtest_counter_dependency() {
+  command -v iptables &>/dev/null && return 0
+  if is_nixos; then
     return 1
   fi
-  SPEEDTEST_TOSUTIL_BIN="/usr/local/bin/tosutil"
-  clear_dependency_install_notice
-  return 0
+  if command -v apt-get &>/dev/null; then
+    DEBIAN_FRONTEND=noninteractive $USE_SUDO apt-get install -y -qq iptables >/dev/null 2>&1
+  elif command -v dnf &>/dev/null; then
+    $USE_SUDO dnf install -y -q iptables >/dev/null 2>&1
+  elif command -v yum &>/dev/null; then
+    $USE_SUDO yum install -y -q iptables >/dev/null 2>&1
+  elif command -v apk &>/dev/null; then
+    $USE_SUDO apk add --no-cache iptables >/dev/null 2>&1
+  else
+    return 1
+  fi
+  command -v iptables &>/dev/null
 }
 
 speedtest_retrans_count() {
   nstat -az 2>/dev/null | awk '$1=="TcpRetransSegs"{print $2; found=1} END{if(!found) print 0}'
-}
-
-speedtest_apply_limit() {
-  local rate="$1"
-  speedtest_cleanup
-  if [ "$rate" = "unlimited" ]; then
-    return 0
-  fi
-
-  modprobe ifb >/dev/null 2>&1 || return 1
-  if ! ip link show "$SPEEDTEST_IFB" >/dev/null 2>&1; then
-    ip link add "$SPEEDTEST_IFB" type ifb >/dev/null 2>&1 || return 1
-    SPEEDTEST_CREATED_IFB=1
-  fi
-  ip link set "$SPEEDTEST_IFB" up >/dev/null 2>&1 || return 1
-  tc qdisc add dev "$SPEEDTEST_IFACE" root tbf rate "${rate}mbit" burst 1mb latency 500ms >/dev/null 2>&1 || return 1
-  tc qdisc add dev "$SPEEDTEST_IFACE" handle ffff: ingress >/dev/null 2>&1 || return 1
-  tc filter add dev "$SPEEDTEST_IFACE" parent ffff: protocol all u32 \
-    match u32 0 0 action mirred egress redirect dev "$SPEEDTEST_IFB" >/dev/null 2>&1 || return 1
-  tc qdisc add dev "$SPEEDTEST_IFB" root tbf rate "${rate}mbit" burst 1mb latency 500ms >/dev/null 2>&1 || return 1
 }
 
 speedtest_result_valid() {
@@ -3256,70 +4385,30 @@ speedtest_result_valid() {
   [ "$value" != "failed" ] && [ -n "$value" ]
 }
 
-speedtest_endpoint_hosts() {
-  printf '%s\n' \
-    "tos-${SPEEDTEST_TOS_REGION}.volces.com" \
-    "tos7-public.${SPEEDTEST_TOS_REGION}.tos.volces.com"
-}
-
-speedtest_restore_hosts() {
-  [ -n "${SPEEDTEST_HOSTS_BACKUP:-}" ] && [ -f "$SPEEDTEST_HOSTS_BACKUP" ] || return 0
-  if [ "$SPEEDTEST_HOSTS_EXISTED" -eq 1 ]; then
-    $USE_SUDO cp "$SPEEDTEST_HOSTS_BACKUP" /etc/hosts 2>/dev/null || true
-  else
-    printf '127.0.0.1 localhost\n::1 localhost\n' | $USE_SUDO tee /etc/hosts >/dev/null 2>&1 || true
-  fi
-  rm -f "$SPEEDTEST_HOSTS_BACKUP"
-  SPEEDTEST_HOSTS_BACKUP=""
-  SPEEDTEST_HOSTS_EXISTED=0
-}
-
-speedtest_force_hosts() {
-  local ip="$1" tmp host
-  [ -n "$ip" ] || return 1
-  if [ ! -e /etc/hosts ]; then
-    printf '127.0.0.1 localhost\n::1 localhost\n' | $USE_SUDO tee /etc/hosts >/dev/null || return 1
-  fi
-  if [ -z "${SPEEDTEST_HOSTS_BACKUP:-}" ]; then
-    SPEEDTEST_HOSTS_BACKUP=$(mktemp /tmp/tcpquality-tos-hosts.XXXXXX)
-    if [ -f /etc/hosts ]; then
-      cp /etc/hosts "$SPEEDTEST_HOSTS_BACKUP" || return 1
-      SPEEDTEST_HOSTS_EXISTED=1
-    else
-      : > "$SPEEDTEST_HOSTS_BACKUP" || return 1
-      SPEEDTEST_HOSTS_EXISTED=0
-    fi
-  fi
-  tmp=$(mktemp /tmp/tcpquality-tos-hosts-new.XXXXXX)
-  awk -v begin="$SPEEDTEST_HOSTS_MARK_BEGIN" -v end="$SPEEDTEST_HOSTS_MARK_END" '
-    $0 == begin {skip=1; next}
-    $0 == end {skip=0; next}
-    !skip {print}
-  ' "$SPEEDTEST_HOSTS_BACKUP" > "$tmp"
-  {
-    echo "$SPEEDTEST_HOSTS_MARK_BEGIN"
-    while IFS= read -r host; do
-      [ -n "$host" ] && echo "$ip $host"
-    done < <(speedtest_endpoint_hosts)
-    echo "$SPEEDTEST_HOSTS_MARK_END"
-  } >> "$tmp"
-  $USE_SUDO cp "$tmp" /etc/hosts || {
-    rm -f "$tmp"
-    return 1
-  }
-  rm -f "$tmp"
-}
-
 speedtest_parse_rate_mbps() {
   awk '
-    /Average .* rate:/ {
-      value = $(NF)
-      gsub(/[^0-9.]/, "", value)
-      unit = $(NF)
-      if (unit ~ /GB\/s/) value = value * 8000
-      else if (unit ~ /MB\/s/) value = value * 8
-      else if (unit ~ /KB\/s/) value = value * 8 / 1000
-      else if (unit ~ /B\/s/) value = value * 8 / 1000000
+    tolower($0) ~ /average/ && tolower($0) ~ /rate:/ {
+      line = $0
+      sub(/^.*[Rr][Aa][Tt][Ee]:[[:space:]]*/, "", line)
+      compact = line
+      gsub(/[[:space:]]+/, "", compact)
+      if (match(compact, /[0-9]+([.][0-9]+)?[GgMmKk]?[Bb]\/[Ss]/)) {
+        token = substr(compact, RSTART, RLENGTH)
+        value = token
+        unit = token
+        gsub(/[^0-9.]/, "", value)
+        gsub(/[0-9.[:space:]]/, "", unit)
+      } else {
+        value = $(NF)
+        unit = $(NF)
+        gsub(/[^0-9.]/, "", value)
+      }
+      unit = toupper(unit)
+      if (unit ~ /GB\/S/) value = value * 8000
+      else if (unit ~ /MB\/S/) value = value * 8
+      else if (unit ~ /KB\/S/) value = value * 8 / 1000
+      else if (unit ~ /B\/S/) value = value * 8 / 1000000
+      else next
       printf "%.1f", value
       found = 1
     }
@@ -3333,68 +4422,713 @@ speedtest_net_bytes() {
   cat "/sys/class/net/$SPEEDTEST_IFACE/statistics/$stat" 2>/dev/null || printf -- '-'
 }
 
+speedtest_counter_stop_current() {
+  if [ -n "${SPEEDTEST_COUNTER_CHAIN:-}" ] && [ -n "${SPEEDTEST_COUNTER_HOOK:-}" ]; then
+    $USE_SUDO iptables -D "$SPEEDTEST_COUNTER_HOOK" -j "$SPEEDTEST_COUNTER_CHAIN" >/dev/null 2>&1 || true
+    $USE_SUDO iptables -F "$SPEEDTEST_COUNTER_CHAIN" >/dev/null 2>&1 || true
+    $USE_SUDO iptables -X "$SPEEDTEST_COUNTER_CHAIN" >/dev/null 2>&1 || true
+  fi
+  SPEEDTEST_COUNTER_CHAIN=""
+  SPEEDTEST_COUNTER_HOOK=""
+}
+
+speedtest_counter_start() {
+  local probe_type="$1" server_ip="$2" hook chain
+  speedtest_counter_stop_current
+  command -v iptables &>/dev/null || return 1
+  [ -n "$server_ip" ] || return 1
+
+  if [ "$probe_type" = "download" ]; then
+    hook="INPUT"
+  else
+    hook="OUTPUT"
+  fi
+  chain="TCPQ_TOS_$$_$RANDOM"
+
+  $USE_SUDO iptables -N "$chain" >/dev/null 2>&1 || return 1
+  $USE_SUDO iptables -I "$hook" 1 -j "$chain" >/dev/null 2>&1 || {
+    $USE_SUDO iptables -F "$chain" >/dev/null 2>&1 || true
+    $USE_SUDO iptables -X "$chain" >/dev/null 2>&1 || true
+    return 1
+  }
+
+  if [ "$probe_type" = "download" ]; then
+    $USE_SUDO iptables -A "$chain" -p tcp -s "$server_ip" --sport 443 -j RETURN >/dev/null 2>&1 || {
+      SPEEDTEST_COUNTER_CHAIN="$chain"
+      SPEEDTEST_COUNTER_HOOK="$hook"
+      speedtest_counter_stop_current
+      return 1
+    }
+  else
+    $USE_SUDO iptables -A "$chain" -p tcp -d "$server_ip" --dport 443 -j RETURN >/dev/null 2>&1 || {
+      SPEEDTEST_COUNTER_CHAIN="$chain"
+      SPEEDTEST_COUNTER_HOOK="$hook"
+      speedtest_counter_stop_current
+      return 1
+    }
+  fi
+
+  SPEEDTEST_COUNTER_CHAIN="$chain"
+  SPEEDTEST_COUNTER_HOOK="$hook"
+  return 0
+}
+
+speedtest_counter_bytes() {
+  [ -n "${SPEEDTEST_COUNTER_CHAIN:-}" ] || {
+    printf -- '-'
+    return 0
+  }
+  $USE_SUDO iptables -L "$SPEEDTEST_COUNTER_CHAIN" -v -x -n 2>/dev/null | awk '
+    NR > 2 && $3 == "RETURN" { print $2; found=1; exit }
+    END { if (!found) print "-" }
+  '
+}
+
 speedtest_calc_mbps() {
   local bytes="$1" seconds="$2"
   awk -v b="$bytes" -v s="$seconds" 'BEGIN {
-    if (s <= 0 || b < 0) printf "failed";
-    else printf "%.1f", b * 8 / s / 1000000;
+    mbps = b * 8 / s / 1000000;
+    if (s <= 0 || b <= 0 || mbps < 0.05) printf "failed";
+    else printf "%.1f", mbps;
   }'
 }
 
+speedtest_parse_cost_ms() {
+  local label="$1"
+  awk -v label="$label" '
+    index(tolower($0), tolower(label)) {
+      value = $0
+      sub(/^.*:[[:space:]]*/, "", value)
+      if (match(value, /-?[0-9]+/)) {
+        print substr(value, RSTART, RLENGTH)
+        found = 1
+        exit
+      }
+    }
+    END { if (!found) print "-" }
+  '
+}
+
+speedtest_write_probe_meta() {
+  local output_file="$1" probe_type="$2" server_ip="$3" exit_code="$4" result="$5" parsed="$6" connect_ms="$7" tls_ms="$8"
+  {
+    printf 'probe_type=%s\n' "$probe_type"
+    printf 'server_ip=%s\n' "$server_ip"
+    printf 'exit_code=%s\n' "$exit_code"
+    printf 'result=%s\n' "$result"
+    printf 'parsed_rate_mbps=%s\n' "$parsed"
+    printf 'connect_ms=%s\n' "$connect_ms"
+    printf 'tls_ms=%s\n' "$tls_ms"
+    printf 'target_host=%s\n' "$(speedtest_tos_bucket_host "$SPEEDTEST_TOS_REGION" 2>/dev/null || true)"
+    printf 'pin_method=curl--resolve\n'
+    printf 'region=%s\n' "$SPEEDTEST_TOS_REGION"
+    printf 'network=%s\n' "$SPEEDTEST_TOS_NETWORK"
+    printf 'object_size=%s\n' "$SPEEDTEST_TOS_SIZE"
+    printf 'timeout=%s\n' "$SPEEDTEST_TOS_TIMEOUT"
+    printf 'recorded_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  } > "${output_file}.meta" 2>/dev/null || true
+}
+
+speedtest_tos_bucket_host() {
+  local region="$1" bucket
+  case "$region" in
+    cn-beijing) bucket="beijing" ;;
+    cn-shanghai) bucket="shanghai" ;;
+    cn-guangzhou) bucket="guangzhou" ;;
+    *) return 1 ;;
+  esac
+  printf 'probe-bucket-%s.tos-%s.volces.com' "$bucket" "$region"
+}
+
+speedtest_tos_object_size_bytes() {
+  local value="${SPEEDTEST_TOS_SIZE^^}" number unit multiplier
+  if [[ "$value" =~ ^([0-9]+([.][0-9]+)?)[[:space:]]*([KMGT]?I?B?)$ ]]; then
+    number="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[3]}"
+  else
+    return 1
+  fi
+  case "$unit" in
+    ""|B) multiplier=1 ;;
+    K|KB|KI|KIB) multiplier=1024 ;;
+    M|MB|MI|MIB) multiplier=1048576 ;;
+    G|GB|GI|GIB) multiplier=1073741824 ;;
+    T|TB|TI|TIB) multiplier=1099511627776 ;;
+    *) return 1 ;;
+  esac
+  awk -v number="$number" -v multiplier="$multiplier" 'BEGIN {
+    bytes = number * multiplier;
+    if (bytes < 1) exit 1;
+    printf "%.0f", bytes;
+  }'
+}
+
+speedtest_tos_upload_key() {
+  local uuid
+  uuid=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)
+  if ! [[ "$uuid" =~ ^[0-9a-fA-F-]{16,}$ ]]; then
+    uuid="$(date +%s%N)-$RANDOM"
+  fi
+  printf 'upload/%s' "$uuid"
+}
+
+speedtest_curl_seconds_ms() {
+  awk -v value="$1" 'BEGIN {
+    if (value !~ /^[0-9]+([.][0-9]+)?$/) print "-";
+    else printf "%d", value * 1000 + 0.5;
+  }'
+}
+
+speedtest_curl_delta_ms() {
+  awk -v start="$1" -v end="$2" 'BEGIN {
+    if (start !~ /^[0-9]+([.][0-9]+)?$/ || end !~ /^[0-9]+([.][0-9]+)?$/) {
+      print "-";
+      exit;
+    }
+    delta = (end - start) * 1000;
+    if (delta < 0) delta = 0;
+    printf "%d", delta + 0.5;
+  }'
+}
+
+speedtest_curl_rate_mbps() {
+  awk -v bytes_per_second="$1" 'BEGIN {
+    if (bytes_per_second !~ /^[0-9]+([.][0-9]+)?$/ || bytes_per_second <= 0) {
+      print "failed";
+      exit;
+    }
+    printf "%.2f", bytes_per_second / 1000000;
+  }'
+}
+
+speedtest_zero_stream() {
+  local bytes="$1" full_blocks remainder
+  full_blocks=$((bytes / 1048576))
+  remainder=$((bytes % 1048576))
+  [ "$full_blocks" -gt 0 ] && dd if=/dev/zero bs=1048576 count="$full_blocks" 2>/dev/null
+  [ "$remainder" -gt 0 ] && dd if=/dev/zero bs=1 count="$remainder" 2>/dev/null
+}
+
+speedtest_tos_delete_object() {
+  local host="$1" server_ip="$2" key="$3"
+  [ -n "$host" ] && [ -n "$server_ip" ] && [ -n "$key" ] || return 0
+  curl -4 --noproxy '*' --http1.1 -sS -o /dev/null \
+    --connect-timeout 5 --max-time 10 \
+    --resolve "$host:443:$server_ip" -X DELETE \
+    "https://$host/$key" >/dev/null 2>&1 || true
+}
+
+speedtest_read_sysctl() {
+  local key="$1" path
+  path="/proc/sys/${key//./\/}"
+  if [ -r "$path" ]; then
+    tr '\t' ' ' < "$path" 2>/dev/null | awk '{$1=$1; print}'
+  else
+    sysctl -n "$key" 2>/dev/null | tr '\t' ' ' | awk '{$1=$1; print}'
+  fi
+}
+
+speedtest_qdisc_name() {
+  local iface="${SPEEDTEST_IFACE:-}" root_qdisc default_qdisc
+  if [ -n "$iface" ]; then
+    root_qdisc=$(tc qdisc show dev "$iface" 2>/dev/null | awk '/ root / {print $2; exit}')
+  fi
+  default_qdisc=$(speedtest_read_sysctl net.core.default_qdisc)
+  if [ -n "$default_qdisc" ]; then
+    printf '%s' "$default_qdisc"
+  elif [ -n "$root_qdisc" ] && [ "$root_qdisc" != "noqueue" ]; then
+    printf '%s' "$root_qdisc"
+  elif [ -n "$root_qdisc" ]; then
+    printf '%s' "$root_qdisc"
+  else
+    printf '-'
+  fi
+}
+
+speedtest_tcp_window_bytes() {
+  local values="$1"
+  awk -v values="$values" 'BEGIN {
+    n = split(values, parts, /[[:space:]]+/);
+    if (n >= 3 && parts[3] ~ /^[0-9]+$/) print parts[3];
+    else print "-";
+  }'
+}
+
+speedtest_min_window_bytes() {
+  local tcp_max="$1" endpoint_max="$2"
+  awk -v tcp_max="$tcp_max" -v endpoint_max="$endpoint_max" 'BEGIN {
+    if (tcp_max ~ /^[0-9]+$/ && endpoint_max ~ /^[0-9]+$/) print (tcp_max < endpoint_max ? tcp_max : endpoint_max);
+    else if (tcp_max ~ /^[0-9]+$/) print tcp_max;
+    else if (endpoint_max ~ /^[0-9]+$/) print endpoint_max;
+    else print "-";
+  }'
+}
+
+speedtest_append_tcp_config_csv() {
+  local csv="$1" cc qdisc rmem wmem rwin swin tcp_rwin tcp_swin endpoint_window window_scaling moderate_rcvbuf
+  cc=$(speedtest_read_sysctl net.ipv4.tcp_congestion_control)
+  qdisc=$(speedtest_qdisc_name)
+  rmem=$(speedtest_read_sysctl net.ipv4.tcp_rmem)
+  wmem=$(speedtest_read_sysctl net.ipv4.tcp_wmem)
+  window_scaling=$(speedtest_read_sysctl net.ipv4.tcp_window_scaling)
+  moderate_rcvbuf=$(speedtest_read_sysctl net.ipv4.tcp_moderate_rcvbuf)
+  endpoint_window=16777216
+  tcp_rwin=$(speedtest_tcp_window_bytes "$rmem")
+  tcp_swin=$(speedtest_tcp_window_bytes "$wmem")
+  rwin=$(speedtest_min_window_bytes "$tcp_rwin" "$endpoint_window")
+  swin=$(speedtest_min_window_bytes "$tcp_swin" "$endpoint_window")
+  printf '三网单线程配置,TCP,%s,%s,,,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "${cc:-}" "${qdisc:-}" "OK" "${rmem:-}" "${wmem:-}" "${rwin:-}" "${swin:-}" \
+    "${window_scaling:-}" "${moderate_rcvbuf:-}" >> "$csv"
+}
+
+speedtest_safe_debug_name() {
+  printf '%s' "$*" | tr -c 'A-Za-z0-9_.-' '_'
+}
+
+speedtest_record_failure_debug() {
+  local group_label="$1" carrier="$2" direction="$3" server_id="$4" city="$5" result_file="$6"
+  local debug_dir name meta_file
+  debug_dir="$RESULT_DIR/speedtest-debug"
+  mkdir -p "$debug_dir" 2>/dev/null || return 0
+  name=$(speedtest_safe_debug_name "${group_label}_${carrier}_${direction}_${server_id:-unknown}")
+  meta_file="$debug_dir/${name}.meta.txt"
+  {
+    printf 'group=%s\n' "$group_label"
+    printf 'carrier=%s\n' "$carrier"
+    printf 'direction=%s\n' "$direction"
+    printf 'server_ip=%s\n' "${server_id:-}"
+    printf 'city=%s\n' "${city:-}"
+    printf 'selected_region=%s\n' "$SPEEDTEST_TOS_REGION"
+    printf 'saved_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    if [ -f "${result_file}.meta" ]; then
+      printf '\n[probe_meta]\n'
+      cat "${result_file}.meta" 2>/dev/null || true
+    fi
+  } > "$meta_file" 2>/dev/null || true
+  [ -f "$result_file" ] && cp "$result_file" "$debug_dir/${name}.stdout.txt" 2>/dev/null || true
+  [ -f "${result_file}.err" ] && cp "${result_file}.err" "$debug_dir/${name}.stderr.txt" 2>/dev/null || true
+}
+
+speedtest_record_manual_failure_debug() {
+  local group_label="$1" carrier="$2" server_id="$3" city="$4" reason="$5"
+  local debug_dir name
+  debug_dir="$RESULT_DIR/speedtest-debug"
+  mkdir -p "$debug_dir" 2>/dev/null || return 0
+  name=$(speedtest_safe_debug_name "${group_label}_${carrier}_setup_${server_id:-unknown}")
+  {
+    printf 'group=%s\n' "$group_label"
+    printf 'carrier=%s\n' "$carrier"
+    printf 'server_ip=%s\n' "${server_id:-}"
+    printf 'city=%s\n' "${city:-}"
+    printf 'selected_region=%s\n' "$SPEEDTEST_TOS_REGION"
+    printf 'reason=%s\n' "$reason"
+    printf 'saved_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  } > "$debug_dir/${name}.meta.txt" 2>/dev/null || true
+}
+
 speedtest_run_probe() {
-  local probe_type="$1" output_file="$2"
-  local before after retrans start_bytes end_bytes delta_bytes start_time end_time duration
-  local output parsed pid elapsed exit_code result
+  local probe_type="$1" output_file="$2" server_ip="$3"
+  local before after retrans start_bytes end_bytes delta_bytes counter_enabled
+  local host key size timeout meta raw_file exit_code result parsed
+  local http_code bytes_download speed_download bytes_upload speed_upload
+  local dns_time connect_time appconnect_time pretransfer_time starttransfer_time total_time remote_ip
+  local dns_ms build_ms send_ms wait_ms total_ms rate_bytes_per_second rate_mb display_connect_ms display_tls_ms
+  local reported_connect_ms reported_tls_ms
+  local -a curl_args pipeline_status
 
-  "$SPEEDTEST_TOSUTIL_BIN" probe -tr "$SPEEDTEST_TOS_REGION" -pt "$probe_type" \
-    -nt "$SPEEDTEST_TOS_NETWORK" -ps "$SPEEDTEST_TOS_SIZE" -timeout "$SPEEDTEST_TOS_TIMEOUT" \
-    >"$output_file" 2>"${output_file}.err" &
-  pid=$!
+  host=$(speedtest_tos_bucket_host "$SPEEDTEST_TOS_REGION" 2>/dev/null || true)
+  size=$(speedtest_tos_object_size_bytes 2>/dev/null || true)
+  timeout="$SPEEDTEST_TOS_TIMEOUT"
+  [[ "$timeout" =~ ^[0-9]+$ ]] && [ "$timeout" -gt 0 ] || timeout=15
+  raw_file="${output_file}.curl"
+  key=""
 
-  elapsed=0
-  while [ "$elapsed" -lt "$SPEEDTEST_TOS_WARMUP" ] && kill -0 "$pid" 2>/dev/null; do
-    sleep 1
-    elapsed=$((elapsed + 1))
-  done
-
-  if ! kill -0 "$pid" 2>/dev/null; then
-    wait "$pid" 2>/dev/null || true
-    printf 'failed|0'
+  if [ -z "$host" ] || ! [[ "$server_ip" =~ ^([0-9]{1,3}[.]){3}[0-9]{1,3}$ ]] || [ -z "$size" ] || [ "$size" -le 0 ] || [ "$SPEEDTEST_TOS_NETWORK" != "public" ]; then
+    printf 'Average %s rate: failed\n\nTime consuming details\n' "$probe_type" > "$output_file"
+    printf 'Build connection cost: -1 ms\nTls handshake cost: -1 ms\n' >> "$output_file"
+    : > "${output_file}.err"
+    speedtest_write_probe_meta "$output_file" "$probe_type" "$server_ip" 2 failed failed -1 -1
+    printf 'failed|0|-1|-1'
     return 0
   fi
 
-  start_bytes=$(speedtest_net_bytes "$probe_type")
-  before=$(speedtest_retrans_count)
-  start_time=$(date +%s)
-  if wait "$pid"; then
-    exit_code=0
+  curl_args=(
+    curl -4 --noproxy '*' --http1.1 -sS --fail
+    --connect-timeout 5 --max-time "$timeout"
+    --resolve "$host:443:$server_ip"
+    -A 'TcpQuality fixed TOS probe'
+    -w '%{http_code}|%{size_download}|%{speed_download}|%{size_upload}|%{speed_upload}|%{time_namelookup}|%{time_connect}|%{time_appconnect}|%{time_pretransfer}|%{time_starttransfer}|%{time_total}|%{remote_ip}'
+    -o /dev/null
+  )
+  if [ "$probe_type" = "upload" ]; then
+    key=$(speedtest_tos_upload_key)
+    curl_args+=(
+      -X PUT -H "Content-Length: $size" --upload-file -
+      "https://$host/$key"
+    )
   else
+    curl_args+=(
+      --range "0-$((size - 1))"
+      "https://$host/download/test"
+    )
+  fi
+
+  counter_enabled=0
+  if speedtest_counter_start "$probe_type" "$server_ip"; then
+    counter_enabled=1
+    start_bytes=$(speedtest_counter_bytes)
+  else
+    SPEEDTEST_RANK_ELIGIBLE=0
+    SPEEDTEST_RANK_DISABLED_REASON="target_counter_unavailable"
+    start_bytes=$(speedtest_net_bytes "$probe_type")
+  fi
+  before=$(speedtest_retrans_count)
+  set +e
+  if [ "$probe_type" = "upload" ]; then
+    speedtest_zero_stream "$size" | "${curl_args[@]}" > "$raw_file" 2>"${output_file}.err"
+    pipeline_status=(${PIPESTATUS[@]})
+    exit_code=${pipeline_status[1]:-1}
+  else
+    "${curl_args[@]}" > "$raw_file" 2>"${output_file}.err"
     exit_code=$?
   fi
-  end_time=$(date +%s)
-  end_bytes=$(speedtest_net_bytes "$probe_type")
+  set -e
+  if [ "$counter_enabled" -eq 1 ]; then
+    end_bytes=$(speedtest_counter_bytes)
+    if [ "$start_bytes" = "-" ] || [ "$end_bytes" = "-" ]; then
+      SPEEDTEST_RANK_ELIGIBLE=0
+      SPEEDTEST_RANK_DISABLED_REASON="target_counter_read_failed"
+    fi
+  else
+    end_bytes=$(speedtest_net_bytes "$probe_type")
+  fi
+  speedtest_counter_stop_current
   after=$(speedtest_retrans_count)
-  output=$(cat "$output_file" 2>/dev/null || true)
-  parsed=$(printf '%s\n' "$output" | speedtest_parse_rate_mbps || true)
-
   retrans=$((after - before))
   [ "$retrans" -ge 0 ] || retrans=0
 
-  if [ "$start_bytes" = "-" ] || [ "$end_bytes" = "-" ]; then
-    result="$parsed"
+  meta=$(cat "$raw_file" 2>/dev/null || true)
+  IFS='|' read -r http_code bytes_download speed_download bytes_upload speed_upload \
+    dns_time connect_time appconnect_time pretransfer_time starttransfer_time total_time remote_ip <<< "$meta"
+  dns_ms=$(speedtest_curl_seconds_ms "$dns_time")
+  build_ms=$(speedtest_curl_delta_ms "$dns_time" "$connect_time")
+  tls_ms=$(speedtest_curl_delta_ms "$connect_time" "$appconnect_time")
+  total_ms=$(speedtest_curl_seconds_ms "$total_time")
+  if [ "$probe_type" = "upload" ]; then
+    wait_ms=0
+    send_ms=$(speedtest_curl_delta_ms "$pretransfer_time" "$total_time")
+    rate_bytes_per_second="${speed_upload:-0}"
   else
-    duration=$((end_time - start_time))
-    delta_bytes=$((end_bytes - start_bytes))
-    result=$(speedtest_calc_mbps "$delta_bytes" "$duration")
-    [ "$result" != "failed" ] || result="$parsed"
+    send_ms=0
+    wait_ms=$(speedtest_curl_delta_ms "$pretransfer_time" "$starttransfer_time")
+    rate_bytes_per_second="${speed_download:-0}"
   fi
+  rate_mb=$(speedtest_curl_rate_mbps "$rate_bytes_per_second")
+  {
+    if [ "$rate_mb" = "failed" ]; then
+      printf 'Average %s rate: failed\n' "$probe_type"
+    else
+      printf 'Average %s rate: %sMB/s\n' "$probe_type" "$rate_mb"
+    fi
+    printf '\nTime consuming details\n'
+    printf 'Resolve dns cost: %s ms\n' "$dns_ms"
+    printf 'Build connection cost: %s ms\n' "$build_ms"
+    printf 'Tls handshake cost: %s ms\n' "$tls_ms"
+    printf 'Send request cost: %s ms\n' "$send_ms"
+    printf 'Wait response cost: %s ms\n' "$wait_ms"
+    printf 'Total cost: %s ms\n' "$total_ms"
+    printf 'Fixed target: %s (%s)\n' "$server_ip" "${remote_ip:-unknown}"
+  } > "$output_file"
 
-  if [ "$exit_code" -ne 0 ] && [ "$parsed" = "failed" ]; then
+  parsed=$(speedtest_parse_rate_mbps < "$output_file" || true)
+  result="$parsed"
+  # 超时后的部分传输仍有有效平均速率，保持与官方 probe 一致，允许展示该结果；
+  # 只有没有有效速率或 HTTP 请求本身没有成功建立时才判定失败。
+  if [ "$parsed" = "failed" ] || { ! [[ "$http_code" =~ ^2[0-9][0-9]$ ]] && [ "${rate_bytes_per_second:-0}" = "0" ]; }; then
     result="failed"
   fi
 
-  printf '%s|%s' "${result:-failed}" "$retrans"
+  if [ "$result" = "failed" ]; then
+    # 失败方向没有有效的目标重传/延迟数据；nstat 是主机全局计数，不能作为该方向的结果。
+    retrans="failed"
+    reported_connect_ms="failed"
+    reported_tls_ms="failed"
+    sed -i \
+      -e 's/^Build connection cost: .*/Build connection cost: failed/' \
+      -e 's/^Tls handshake cost: .*/Tls handshake cost: failed/' \
+      "$output_file"
+  else
+    reported_connect_ms="$build_ms"
+    reported_tls_ms="$tls_ms"
+  fi
+
+  if [ "$counter_enabled" -eq 1 ]; then
+    if [ "$start_bytes" = "-" ] || [ "$end_bytes" = "-" ]; then
+      SPEEDTEST_RANK_ELIGIBLE=0
+      SPEEDTEST_RANK_DISABLED_REASON="target_counter_read_failed"
+    else
+      delta_bytes=$((end_bytes - start_bytes))
+      if [ "$delta_bytes" -le 0 ]; then
+        SPEEDTEST_RANK_ELIGIBLE=0
+        SPEEDTEST_RANK_DISABLED_REASON="target_counter_zero"
+      fi
+    fi
+  fi
+
+  if [ "$probe_type" = "upload" ] && [ -n "$key" ]; then
+    speedtest_tos_delete_object "$host" "$server_ip" "$key"
+  fi
+  speedtest_write_probe_meta "$output_file" "$probe_type" "$server_ip" "$exit_code" "${result:-failed}" "${parsed:-failed}" "$reported_connect_ms" "$reported_tls_ms"
+  rm -f "$raw_file"
+  display_connect_ms="$reported_connect_ms"
+  display_tls_ms="$reported_tls_ms"
+  # CSV/SVG 的现有兼容层会将连接/TLS字段除以 2；连接耗时保持旧兼容口径，
+  # TLS 耗时保留原始 curl 值，使报告中的 TLS 延迟显示为握手耗时的一半。
+  [[ "$display_connect_ms" =~ ^[0-9]+$ ]] && display_connect_ms=$((display_connect_ms * 2))
+  printf '%s|%s|%s|%s' "${result:-failed}" "$retrans" "$display_connect_ms" "$display_tls_ms"
   return 0
+}
+
+speedtest_applecdn_timeout() {
+  local timeout="$SPEEDTEST_TOS_TIMEOUT"
+  if ! [[ "$timeout" =~ ^[0-9]+$ ]] || [ "$timeout" -le 0 ]; then
+    timeout=15
+  fi
+  printf '%s' "$timeout"
+}
+
+speedtest_applecdn_max_mb() {
+  local max_mb="$SPEEDTEST_APPLECDN_MAX_MB"
+  if ! [[ "$max_mb" =~ ^[0-9]+$ ]] || [ "$max_mb" -le 0 ]; then
+    max_mb=2048
+  fi
+  printf '%s' "$max_mb"
+}
+
+speedtest_applecdn_calc_mbps() {
+  local bytes_per_second="$1"
+  awk -v bps="$bytes_per_second" 'BEGIN {
+    if (bps <= 0) {
+      printf "failed";
+      exit;
+    }
+    mbps = bps * 8 / 1000000;
+    if (mbps < 0.05) printf "failed";
+    else printf "%.1f", mbps;
+  }'
+}
+
+speedtest_applecdn_seconds_to_ms() {
+  local seconds="$1"
+  awk -v s="$seconds" 'BEGIN {
+    if (s <= 0) printf "-";
+    else printf "%d", int(s * 1000 + 0.5);
+  }'
+}
+
+speedtest_ipv4_available() {
+  ip -4 route get 17.253.144.10 >/dev/null 2>&1
+}
+
+speedtest_ipv6_available() {
+  local response
+  if [ "$SPEEDTEST_IPV6_CHECKED" -eq 1 ]; then
+    [ "$SPEEDTEST_IPV6_AVAILABLE" -eq 1 ]
+    return
+  fi
+  SPEEDTEST_IPV6_CHECKED=1
+  SPEEDTEST_IPV6_AVAILABLE=0
+  if ipv6_available; then
+    SPEEDTEST_IPV6_AVAILABLE=1
+    return 0
+  fi
+  command -v curl >/dev/null 2>&1 || return 1
+  response=$(curl -6 -fsS --connect-timeout 5 --max-time 8 \
+    "$SPEEDTEST_IPV6_PROBE_URL" 2>/dev/null | \
+    awk 'NR == 1 {gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print}')
+  if is_valid_ipv6 "$response"; then
+    IPV6_PUBLIC="$response"
+    IPV6_WORK=1
+    SPEEDTEST_IPV6_AVAILABLE=1
+    return 0
+  fi
+  return 1
+}
+
+speedtest_applecdn_curl_download() {
+  local output_file="$1" ip_flag="$2" fixed_ip="${3:-}" timeout meta exit_code http_code bytes total curl_speed connect appconnect starttransfer remote_ip
+  local before after retrans speed latency
+  local -a resolve_args=()
+  timeout=$(speedtest_applecdn_timeout)
+  [ -n "$fixed_ip" ] && resolve_args=(--resolve "$SPEEDTEST_APPLECDN_HOST:443:[$fixed_ip]")
+  before=$(speedtest_retrans_count)
+  set +e
+  meta=$(curl "$ip_flag" -sS -L \
+    --connect-timeout 5 --max-time "$timeout" \
+    "${resolve_args[@]}" \
+    -A "$SPEEDTEST_APPLECDN_USER_AGENT" \
+    -H 'Accept: */*' \
+    -H 'Accept-Language: zh-CN,zh-Hans;q=0.9' \
+    -H 'Accept-Encoding: identity' \
+    -o /dev/null \
+    -w '%{size_download}|%{time_total}|%{speed_download}|%{remote_ip}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{http_code}' \
+    "$SPEEDTEST_APPLECDN_DOWNLOAD_URL" 2>"${output_file}.err")
+  exit_code=$?
+  set -e
+  after=$(speedtest_retrans_count)
+  retrans=$((after - before))
+  [ "$retrans" -ge 0 ] || retrans=0
+  IFS='|' read -r bytes total curl_speed remote_ip connect appconnect starttransfer http_code <<<"$meta"
+  speed=$(speedtest_applecdn_calc_mbps "${curl_speed:-0}")
+  latency=$(speedtest_applecdn_seconds_to_ms "${appconnect:-0}")
+  [ "$latency" = "-" ] && latency=$(speedtest_applecdn_seconds_to_ms "${starttransfer:-0}")
+  if [ "$speed" = "failed" ] || { [ "$exit_code" -ne 0 ] && [ "${bytes:-0}" -le 0 ] 2>/dev/null; }; then
+    printf 'failed|%s|%s|%s' "$retrans" "$(speedtest_applecdn_seconds_to_ms "${connect:-0}")" "$latency"
+  else
+    printf '%s|%s|%s|%s' "$speed" "$retrans" "$(speedtest_applecdn_seconds_to_ms "${connect:-0}")" "$latency"
+  fi
+  {
+    printf 'type=download\n'
+    printf 'exit_code=%s\n' "$exit_code"
+    printf 'http_code=%s\n' "${http_code:-}"
+    printf 'remote_ip=%s\n' "${remote_ip:-}"
+    printf 'bytes=%s\n' "${bytes:-}"
+    printf 'time_total=%s\n' "${total:-}"
+    printf 'speed_download=%s\n' "${curl_speed:-}"
+    printf 'time_connect=%s\n' "${connect:-}"
+    printf 'time_appconnect=%s\n' "${appconnect:-}"
+    printf 'time_starttransfer=%s\n' "${starttransfer:-}"
+  } > "${output_file}.meta.txt" 2>/dev/null || true
+  printf '%s\n' "$meta" > "$output_file" 2>/dev/null || true
+}
+
+speedtest_applecdn_curl_upload() {
+  local output_file="$1" ip_flag="$2" fixed_ip="${3:-}" timeout max_mb meta exit_code http_code bytes total curl_speed connect appconnect starttransfer remote_ip
+  local before after retrans speed latency
+  local -a resolve_args=()
+  timeout=$(speedtest_applecdn_timeout)
+  max_mb=$(speedtest_applecdn_max_mb)
+  [ -n "$fixed_ip" ] && resolve_args=(--resolve "$SPEEDTEST_APPLECDN_HOST:443:[$fixed_ip]")
+  before=$(speedtest_retrans_count)
+  set +e
+  meta=$(
+    dd if=/dev/zero bs=1M count="$max_mb" 2>/dev/null | \
+      curl "$ip_flag" -sS -L \
+        --connect-timeout 5 --max-time "$timeout" \
+        "${resolve_args[@]}" \
+        -T - \
+        -A "$SPEEDTEST_APPLECDN_USER_AGENT" \
+        -H 'Accept: */*' \
+        -H 'Accept-Language: zh-CN,zh-Hans;q=0.9' \
+        -H 'Accept-Encoding: identity' \
+        -H 'Upload-Draft-Interop-Version: 6' \
+        -H 'Upload-Complete: ?1' \
+        -o /dev/null \
+        -w '%{size_upload}|%{time_total}|%{speed_upload}|%{remote_ip}|%{time_connect}|%{time_appconnect}|%{time_starttransfer}|%{http_code}' \
+        "$SPEEDTEST_APPLECDN_UPLOAD_URL" 2>"${output_file}.err"
+  )
+  exit_code=$?
+  set -e
+  after=$(speedtest_retrans_count)
+  retrans=$((after - before))
+  [ "$retrans" -ge 0 ] || retrans=0
+  IFS='|' read -r bytes total curl_speed remote_ip connect appconnect starttransfer http_code <<<"$meta"
+  speed=$(speedtest_applecdn_calc_mbps "${curl_speed:-0}")
+  latency=$(speedtest_applecdn_seconds_to_ms "${appconnect:-0}")
+  [ "$latency" = "-" ] && latency=$(speedtest_applecdn_seconds_to_ms "${starttransfer:-0}")
+  if [ "$speed" = "failed" ] || { [ "$exit_code" -ne 0 ] && [ "${bytes:-0}" -le 0 ] 2>/dev/null; }; then
+    printf 'failed|%s|%s|%s' "$retrans" "$(speedtest_applecdn_seconds_to_ms "${connect:-0}")" "$latency"
+  else
+    printf '%s|%s|%s|%s' "$speed" "$retrans" "$(speedtest_applecdn_seconds_to_ms "${connect:-0}")" "$latency"
+  fi
+  {
+    printf 'type=upload\n'
+    printf 'exit_code=%s\n' "$exit_code"
+    printf 'http_code=%s\n' "${http_code:-}"
+    printf 'remote_ip=%s\n' "${remote_ip:-}"
+    printf 'bytes=%s\n' "${bytes:-}"
+    printf 'time_total=%s\n' "${total:-}"
+    printf 'speed_upload=%s\n' "${curl_speed:-}"
+    printf 'time_connect=%s\n' "${connect:-}"
+    printf 'time_appconnect=%s\n' "${appconnect:-}"
+    printf 'time_starttransfer=%s\n' "${starttransfer:-}"
+  } > "${output_file}.meta.txt" 2>/dev/null || true
+  printf '%s\n' "$meta" > "$output_file" 2>/dev/null || true
+}
+
+speedtest_collect_applecdn() {
+  local workdir result_file family_name ip_flag download download_retrans download_connect download_tls upload upload_retrans upload_connect upload_tls
+  local apple_values=()
+  local apple_families=("Apple IPv4:-4")
+  speedtest_applecdn_tests_enabled || return 0
+  if speedtest_applecdn6_tests_enabled; then
+    apple_families+=("Apple IPv6:-6")
+  fi
+  for family_name in "${apple_families[@]}"; do
+    ip_flag="${family_name##*:}"
+    family_name="${family_name%%:*}"
+    if [ "$ip_flag" = "-4" ] && ! speedtest_ipv4_available; then
+      apple_values+=("-|-|-|$SPEEDTEST_APPLECDN_HOST|$family_name|-|-|-|-")
+      continue
+    fi
+    workdir=$(mktemp -d "$RESULT_DIR/speedtest-applecdn.XXXXXX")
+    result_file="$workdir/result"
+    IFS='|' read -r download download_retrans download_connect download_tls <<<"$(speedtest_applecdn_curl_download "$result_file.download" "$ip_flag")"
+    IFS='|' read -r upload upload_retrans upload_connect upload_tls <<<"$(speedtest_applecdn_curl_upload "$result_file.upload" "$ip_flag")"
+
+    [ "$download" = "failed" ] && speedtest_record_failure_debug "AppleCDN" "$family_name" "download" "$SPEEDTEST_APPLECDN_HOST" "$family_name" "$result_file.download"
+    [ "$upload" = "failed" ] && speedtest_record_failure_debug "AppleCDN" "$family_name" "upload" "$SPEEDTEST_APPLECDN_HOST" "$family_name" "$result_file.upload"
+
+    if speedtest_result_valid "$upload" || speedtest_result_valid "$download"; then
+      apple_values+=("$(speedtest_format_mbps "$upload")|$download_retrans|$(speedtest_format_mbps "$download")|$SPEEDTEST_APPLECDN_HOST|$family_name|$upload_connect|$upload_tls|$download_connect|$download_tls")
+    else
+      apple_values+=("failed|failed|failed|$SPEEDTEST_APPLECDN_HOST|$family_name|$upload_connect|$upload_tls|$download_connect|$download_tls")
+    fi
+    [ "${DEBUG_MODE:-0}" -eq 1 ] || rm -rf "$workdir"
+  done
+  SPEEDTEST_ROWS+=("AppleCDN;${apple_values[0]};${apple_values[1]:-};")
+}
+
+speedtest_collect_applecdn6() {
+  local node label candidates candidate workdir result_file
+  local download download_retrans download_connect download_tls upload upload_retrans upload_connect upload_tls
+  local node_value selected_ip
+  local values=()
+  speedtest_applecdn6_tests_enabled || return 0
+  load_remote_applecdn6_nodes || true
+
+  for node in "${SPEEDTEST_APPLECDN6_NODES[@]}"; do
+    label="${node%%|*}"
+    candidates="${node#*|}"
+    node_value=""
+    selected_ip=""
+    while IFS= read -r candidate; do
+      [ -n "$candidate" ] || continue
+      workdir=$(mktemp -d "$RESULT_DIR/speedtest-applecdn6.XXXXXX")
+      result_file="$workdir/result"
+      IFS='|' read -r download download_retrans download_connect download_tls <<<"$(speedtest_applecdn_curl_download "$result_file.download" "-6" "$candidate")"
+      IFS='|' read -r upload upload_retrans upload_connect upload_tls <<<"$(speedtest_applecdn_curl_upload "$result_file.upload" "-6" "$candidate")"
+
+      [ "$download" = "failed" ] && speedtest_record_failure_debug "IPv6" "$label" "download" "$candidate" "$label" "$result_file.download"
+      [ "$upload" = "failed" ] && speedtest_record_failure_debug "IPv6" "$label" "upload" "$candidate" "$label" "$result_file.upload"
+      if speedtest_result_valid "$upload" || speedtest_result_valid "$download"; then
+        node_value="$(speedtest_format_mbps "$upload")|$upload_retrans|$(speedtest_format_mbps "$download")|$candidate|$label|$upload_connect|$upload_tls|$download_connect|$download_tls"
+        selected_ip="$candidate"
+      fi
+      [ "${DEBUG_MODE:-0}" -eq 1 ] || rm -rf "$workdir"
+      [ -n "$node_value" ] && break
+    done < <(printf '%s\n' "$candidates" | tr '|' '\n')
+
+    if [ -z "$node_value" ]; then
+      selected_ip="${candidates%%|*}"
+      node_value="failed|failed|failed|$selected_ip|$label|-|-|-|-"
+    fi
+    values+=("$node_value")
+  done
+
+  [ "${#values[@]}" -gt 0 ] || return 0
+  SPEEDTEST_ROWS+=("IPv6;${values[0]};${values[1]};")
 }
 
 speedtest_format_mbps() {
@@ -3446,38 +5180,97 @@ speedtest_pad_center() {
 }
 
 speedtest_print_group_header() {
-  local label="$1" title
-  if [ "$label" = "不限" ]; then
-    title='不限速'
-  elif [[ "$label" == *Mbps ]]; then
-    title="限速 $label"
-  else
-    title="$label"
-  fi
+  local column_label="${2:-IPv4}"
 
   # The terminal formatter counts UTF-8 bytes, so align CJK headings by display width.
   printf '  '
-  printf '%b' "$CYAN"
-  speedtest_pad_center 54 "$title"
-  printf '%b' "$NC"
-  printf '\n'
-  printf '  '
-  printf '%b' "$CYAN"; speedtest_pad_left 12 '地区'; printf '%b' "$NC"
+  printf '%b' "$CYAN"; speedtest_pad_left 12 "$column_label"; printf '%b' "$NC"
   printf '  '
   printf '%b' "$CYAN"; speedtest_pad_left 10 '回程重传'; printf '%b' "$NC"
   printf '  '
   printf '%b' "$CYAN"; speedtest_pad_left 12 '回程速度'; printf '%b' "$NC"
   printf '  '
   printf '%b' "$CYAN"; speedtest_pad_left 12 '去程速度'; printf '%b' "$NC"
+  printf '  '
+  printf '%b' "$CYAN"; speedtest_pad_left 10 '回程延迟'; printf '%b' "$NC"
+  printf '  '
+  printf '%b' "$CYAN"; speedtest_pad_left 10 '去程延迟'; printf '%b' "$NC"
   printf '\n'
+}
+
+speedtest_print_applecdn_header() {
+  printf '  '
+  printf '%b' "$CYAN"; speedtest_pad_left 12 '国际方向'; printf '%b' "$NC"
+  printf '  '
+  printf '%b' "$CYAN"; speedtest_pad_left 10 '下载重传'; printf '%b' "$NC"
+  printf '  '
+  printf '%b' "$CYAN"; speedtest_pad_left 12 '下载速度'; printf '%b' "$NC"
+  printf '  '
+  printf '%b' "$CYAN"; speedtest_pad_left 12 '上传速度'; printf '%b' "$NC"
+  printf '  '
+  printf '%b' "$CYAN"; speedtest_pad_left 10 '下载延迟'; printf '%b' "$NC"
+  printf '  '
+  printf '%b' "$CYAN"; speedtest_pad_left 10 '上传延迟'; printf '%b' "$NC"
+  printf '\n'
+}
+
+speedtest_metric_failed() {
+  case "${1,,}" in
+    ""|-|failed|fail)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 speedtest_speed_text() {
   local value="$1"
-  if [ "$value" = "failed" ]; then
+  if speedtest_metric_failed "$value"; then
     printf 'failed'
   else
     printf '%sMbps' "$value"
+  fi
+}
+
+speedtest_latency_text() {
+  local value="$1"
+  case "${value,,}" in
+    failed|fail)
+      printf 'failed'
+      return
+      ;;
+  esac
+  if [[ "$value" =~ ^-?[0-9]+$ ]] && [ "$value" -ge 0 ]; then
+    awk -v value="$value" 'BEGIN { printf "%dms", int(value / 2 + 0.5) }'
+  else
+    printf '-'
+  fi
+}
+
+speedtest_direction_latency_text() {
+  local latency="$1" speed="$2"
+  if speedtest_metric_failed "$speed"; then
+    printf 'failed'
+  else
+    speedtest_latency_text "$latency"
+  fi
+}
+
+speedtest_latency_color() {
+  local value="$1" latency
+  if ! [[ "$value" =~ ^-?[0-9]+$ ]] || [ "$value" -lt 0 ]; then
+    printf '%s' "$RED"
+    return
+  fi
+  latency=$(awk -v value="$value" 'BEGIN { printf "%d", int(value / 2 + 0.5) }')
+  if [ "$latency" -gt 240 ]; then
+    printf '%s' "$RED"
+  elif [ "$latency" -gt 150 ]; then
+    printf '%s' "$YELLOW"
+  else
+    printf '%s' "$GREEN"
   fi
 }
 
@@ -3534,13 +5327,23 @@ speedtest_retrans_color() {
 
 collect_speedtest_results() {
   local group group_region rate label carrier workdir result_file index candidate server_id city candidate_region
-  local upload upload_retrans download download_retrans done total offset
+  local upload upload_retrans upload_connect upload_tls download download_retrans download_connect download_tls done total offset apple_steps apple_ipv6_steps
   local carriers=(电信 联通 移动)
   local carrier_values=()
   offset=${SPEEDTEST_PROGRESS_OFFSET:-0}
   done="$offset"
   total=${SPEEDTEST_PROGRESS_TOTAL:-0}
-  [ "$total" -gt 0 ] 2>/dev/null || total=$((offset + $(speedtest_group_count) * ${#carriers[@]}))
+  apple_steps=0
+  apple_ipv6_steps=0
+  if speedtest_applecdn_tests_enabled; then
+    apple_steps=1
+    if speedtest_applecdn6_tests_enabled; then
+      apple_steps=2
+      load_remote_applecdn6_nodes || true
+      apple_ipv6_steps=${#SPEEDTEST_APPLECDN6_NODES[@]}
+    fi
+  fi
+  [ "$total" -gt 0 ] 2>/dev/null || total=$((offset + $(speedtest_group_count) * ${#carriers[@]} + apple_steps + apple_ipv6_steps))
 
   if [ "${SPEEDTEST_APPEND_STATE:-0}" -eq 1 ]; then
     speedtest_load_background_state || true
@@ -3549,7 +5352,7 @@ collect_speedtest_results() {
   fi
 
   [ "$(uname)" = "Linux" ] || {
-  echo -e "${RED}[X] 三网单线程速度目前仅支持 Linux${NC}"
+  echo -e "${RED}[X] 单线程测速目前仅支持 Linux${NC}"
     exit 1
   }
   require_raw_socket_privilege
@@ -3559,19 +5362,27 @@ collect_speedtest_results() {
     exit 1
   }
   load_remote_speedtest_nodes || true
+  ensure_public_ips_for_rank
+  install_speedtest_counter_dependency || true
+  if ! command -v iptables &>/dev/null; then
+    SPEEDTEST_RANK_ELIGIBLE=0
+    SPEEDTEST_RANK_DISABLED_REASON="iptables_unavailable"
+  fi
   if [ "$DEBUG_MODE" -eq 1 ]; then
     if [ "$SPEEDTEST_TOS_REMOTE_LOADED" -eq 1 ]; then
-      echo -e "${DIM}[debug] tosutil 入口来自 getNodes scope=tos${NC}" >&2
+      echo -e "${DIM}[debug] TOS 节点入口来自 getNodes scope=tos${NC}" >&2
     else
-      echo -e "${DIM}[debug] tosutil 入口使用内置 fallback IP${NC}" >&2
+      echo -e "${DIM}[debug] TOS 节点入口使用内置 fallback IP${NC}" >&2
     fi
-    echo -e "${DIM}[debug] tosutil 电信 $SPEEDTEST_TOS_CT_IP / 联通 $SPEEDTEST_TOS_CU_IP / 移动 $SPEEDTEST_TOS_CM_IP${NC}" >&2
+    echo -e "${DIM}[debug] 固定 IP: 电信 $SPEEDTEST_TOS_CT_IP / 联通 $SPEEDTEST_TOS_CU_IP / 移动 $SPEEDTEST_TOS_CM_IP${NC}" >&2
+    echo -e "${DIM}[debug] 传输方式: curl --resolve（保留 TOS Host/SNI）${NC}" >&2
   fi
-  install_tosutil_speedtest || {
-    echo -e "${RED}[X] tosutil 安装失败${NC}"
-    exit 1
-  }
-
+  if request_rank_session; then
+    [ "$DEBUG_MODE" -eq 1 ] && echo -e "${DIM}[debug] rank session 已获取${NC}" >&2
+  else
+    [ -n "$SPEEDTEST_RANK_DISABLED_REASON" ] || SPEEDTEST_RANK_DISABLED_REASON="rank_session_request_failed"
+    [ "$DEBUG_MODE" -eq 1 ] && echo -e "${DIM}[debug] rank session 获取失败：$SPEEDTEST_RANK_DISABLED_REASON，本次报告不会进入排名${NC}" >&2
+  fi
   SPEEDTEST_IFACE=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
   [ -n "$SPEEDTEST_IFACE" ] || {
     echo -e "${RED}[X] 无法识别默认网络接口${NC}"
@@ -3582,17 +5393,12 @@ collect_speedtest_results() {
     trap 'speedtest_cleanup; exit 130' INT TERM
   fi
 
-  echo -e "${BOLD}${CYAN}三网单线程速度${NC}"
+  echo -e "${BOLD}${CYAN}单线程测速${NC}"
   echo
   speedtest_show_progress 0 "$total"
 
   while IFS='|' read -r label group_region rate; do
     [ -n "$label" ] || continue
-    speedtest_apply_limit "$rate" || {
-      echo -e "${RED}[X] 无法应用 ${rate} Mbps 限速${NC}"
-      exit 1
-    }
-    sleep 2
     carrier_values=()
 
     for carrier in "${carriers[@]}"; do
@@ -3608,22 +5414,19 @@ collect_speedtest_results() {
       SPEEDTEST_TOS_REGION="$candidate_region"
       speedtest_set_selected "$carrier" "$server_id" "$city"
 
-      if speedtest_force_hosts "$server_id"; then
-        IFS='|' read -r download download_retrans <<<"$(speedtest_run_probe download "$result_file.download")"
-        IFS='|' read -r upload upload_retrans <<<"$(speedtest_run_probe upload "$result_file.upload")"
-      else
-        download="failed"
-        download_retrans="0"
-        upload="failed"
-        upload_retrans="0"
-      fi
+      IFS='|' read -r download download_retrans download_connect download_tls <<<"$(speedtest_run_probe download "$result_file.download" "$server_id")"
+      IFS='|' read -r upload upload_retrans upload_connect upload_tls <<<"$(speedtest_run_probe upload "$result_file.upload" "$server_id")"
+
+      [ "$download" = "failed" ] && speedtest_record_failure_debug "$label" "$carrier" "download" "$server_id" "$city" "$result_file.download"
+      [ "$upload" = "failed" ] && speedtest_record_failure_debug "$label" "$carrier" "upload" "$server_id" "$city" "$result_file.upload"
 
       if speedtest_result_valid "$upload" || speedtest_result_valid "$download"; then
-        carrier_values+=("$(speedtest_format_mbps "$upload")|$upload_retrans|$(speedtest_format_mbps "$download")|$server_id|$city")
+        carrier_values+=("$(speedtest_format_mbps "$upload")|$upload_retrans|$(speedtest_format_mbps "$download")|$server_id|$city|$upload_connect|$upload_tls|$download_connect|$download_tls")
       else
-        carrier_values+=("failed|failed|failed|$server_id|$city")
+        carrier_values+=("failed|failed|failed|$server_id|$city|$upload_connect|$upload_tls|$download_connect|$download_tls")
       fi
-      rm -rf "$workdir"
+      # debug 模式下保留固定 IP 的 curl 输出文件，方便排查测速异常
+      [ "${DEBUG_MODE:-0}" -eq 1 ] || rm -rf "$workdir"
       done=$((done + 1))
       speedtest_show_progress "$done" "$total"
     done
@@ -3632,12 +5435,40 @@ collect_speedtest_results() {
   done < <(speedtest_group_specs)
 
   speedtest_cleanup
+  if speedtest_applecdn_tests_enabled; then
+    if [ "$apple_ipv6_steps" -gt 0 ]; then
+      speedtest_collect_applecdn6
+      done=$((done + apple_ipv6_steps))
+      speedtest_show_progress "$done" "$total"
+    fi
+    speedtest_collect_applecdn
+    done=$((done + apple_steps))
+    speedtest_show_progress "$done" "$total"
+  fi
+
+  speedtest_cleanup
+  if [ "$SPEEDTEST_RANK_ELIGIBLE" -ne 1 ]; then
+    RANK_SESSION_ID=""
+    RANK_SESSION_TOKEN=""
+    RANK_SESSION_STARTED_AT=""
+    RANK_SESSION_EXPIRES_AT=""
+    RANK_SESSION_IP4=""
+    [ "$DEBUG_MODE" -eq 1 ] && [ -n "$SPEEDTEST_RANK_DISABLED_REASON" ] && \
+      printf '%s\n' "$SPEEDTEST_RANK_DISABLED_REASON" > "$RESULT_DIR/rank_disabled_reason.txt"
+    [ "$DEBUG_MODE" -eq 1 ] && [ -n "$SPEEDTEST_RANK_DISABLED_REASON" ] && \
+      echo -e "${DIM}[debug] 排名凭证已清除：$SPEEDTEST_RANK_DISABLED_REASON${NC}" >&2
+  fi
   if [ -n "${SPEEDTEST_STATE_FILE:-}" ]; then
     {
       printf 'META\t%s|%s|%s|%s|%s|%s\n' \
         "$SPEEDTEST_TELECOM_ID" "$SPEEDTEST_TELECOM_CITY" \
         "$SPEEDTEST_UNICOM_ID" "$SPEEDTEST_UNICOM_CITY" \
         "$SPEEDTEST_MOBILE_ID" "$SPEEDTEST_MOBILE_CITY"
+      printf 'RANK\t%s|%s|%s|%s|%s|%s|%s\n' \
+        "${RANK_SESSION_ID:-}" "${RANK_SESSION_TOKEN:-}" \
+        "${RANK_SESSION_STARTED_AT:-}" "${RANK_SESSION_EXPIRES_AT:-}" \
+        "${RANK_SESSION_IP4:-}" "${SPEEDTEST_RANK_ELIGIBLE:-0}" \
+        "${SPEEDTEST_RANK_DISABLED_REASON:-}"
       printf 'ROW\t%s\n' "${SPEEDTEST_ROWS[@]}"
     } > "$SPEEDTEST_STATE_FILE"
   fi
@@ -3646,15 +5477,32 @@ collect_speedtest_results() {
 
 speedtest_set_failed_rows() {
   SPEEDTEST_ROWS=()
-  local label region rate
+  local label region rate node node_label node_candidates apple_row
+  local ipv6_values=()
   while IFS='|' read -r label region rate; do
     [ -n "$label" ] || continue
-    SPEEDTEST_ROWS+=("$label;failed|failed|failed||;failed|failed|failed||;failed|failed|failed||")
+    SPEEDTEST_ROWS+=("$label;failed|failed|failed|||-|-|-|-;failed|failed|failed|||-|-|-|-;failed|failed|failed|||-|-|-|-")
   done < <(speedtest_group_specs)
+  if speedtest_applecdn_tests_enabled; then
+    if speedtest_applecdn6_tests_enabled; then
+      load_remote_applecdn6_nodes || true
+      for node in "${SPEEDTEST_APPLECDN6_NODES[@]}"; do
+        node_label="${node%%|*}"
+        node_candidates="${node#*|}"
+        ipv6_values+=("failed|failed|failed|${node_candidates%%|*}|$node_label|-|-|-|-")
+      done
+      [ "${#ipv6_values[@]}" -gt 0 ] && SPEEDTEST_ROWS+=("IPv6;${ipv6_values[0]};${ipv6_values[1]};")
+    fi
+    apple_row="AppleCDN;failed|failed|failed|$SPEEDTEST_APPLECDN_HOST|Apple IPv4|-|-|-|-"
+    if speedtest_applecdn6_tests_enabled; then
+      apple_row+=";failed|failed|failed|$SPEEDTEST_APPLECDN_HOST|Apple IPv6|-|-|-|-"
+    fi
+    SPEEDTEST_ROWS+=("$apple_row;")
+  fi
 }
 
 speedtest_load_background_state() {
-  local type value a b c d e f
+  local type value a b c d e f g
   SPEEDTEST_ROWS=()
   [ -s "$SPEEDTEST_STATE_FILE" ] || {
     speedtest_set_failed_rows
@@ -3671,6 +5519,16 @@ speedtest_load_background_state() {
         SPEEDTEST_UNICOM_CITY="$d"
         SPEEDTEST_MOBILE_ID="$e"
         SPEEDTEST_MOBILE_CITY="$f"
+        ;;
+      RANK)
+        IFS='|' read -r a b c d e f g <<<"$value"
+        RANK_SESSION_ID="$a"
+        RANK_SESSION_TOKEN="$b"
+        RANK_SESSION_STARTED_AT="$c"
+        RANK_SESSION_EXPIRES_AT="$d"
+        RANK_SESSION_IP4="$e"
+        SPEEDTEST_RANK_ELIGIBLE="${f:-0}"
+        SPEEDTEST_RANK_DISABLED_REASON="$g"
         ;;
       ROW)
         SPEEDTEST_ROWS+=("$value")
@@ -3719,22 +5577,111 @@ wait_speedtest_background() {
 }
 
 show_speedtest_results() {
-  local row label result1 result2 result3 result upload retrans download server_id city index carrier region upload_text download_text
-  local speed_color retrans_color
+  local row label result1 result2 result3 result upload retrans download server_id city upload_connect upload_tls download_connect download_tls index carrier region upload_text download_text upload_tls_text download_tls_text
+  local speed_color retrans_color tls_color
   local carriers=(电信 联通 移动)
   local results=()
-  echo -e "${BOLD}${CYAN}三网单线程速度${NC}"
+  echo -e "${BOLD}${CYAN}单线程测速${NC}"
   echo
   for row in "${SPEEDTEST_ROWS[@]}"; do
     IFS=';' read -r label result1 result2 result3 <<<"$row"
-    speedtest_print_group_header "$label"
-    results=("$result1" "$result2" "$result3")
+    if [ "$label" = "AppleCDN" ]; then
+      speedtest_print_applecdn_header
+      for result in "$result1" "$result2"; do
+        [ -n "$result" ] || continue
+        IFS='|' read -r upload retrans download server_id city upload_connect upload_tls download_connect download_tls <<<"$result"
+        printf '  '
+        printf '%b' "$CYAN"; speedtest_pad_left 12 "${city:-AppleCDN}"; printf '%b' "$NC"
+        printf '  '
+        if [ "$retrans" = "-" ]; then
+          printf '%b' "$DIM"; speedtest_pad_left 10 '-'; printf '%b' "$NC"
+        elif speedtest_metric_failed "$download"; then
+          printf '%b' "$RED"; speedtest_pad_left 10 'failed'; printf '%b' "$NC"
+        else
+          retrans_color=$(speedtest_retrans_color "$retrans")
+          printf '%b' "$retrans_color"; speedtest_pad_left 10 "$retrans"; printf '%b' "$NC"
+        fi
+        printf '  '
+        if [ "$download" = "-" ]; then
+          download_text="-"
+          speed_color="$DIM"
+        else
+          download_text=$(speedtest_speed_text "$download")
+          speed_color=$(speedtest_speed_color "$download" "不限")
+        fi
+        printf '%b' "$speed_color"; speedtest_pad_left 12 "$download_text"; printf '%b' "$NC"
+        printf '  '
+        if [ "$upload" = "-" ]; then
+          upload_text="-"
+          speed_color="$DIM"
+        else
+          upload_text=$(speedtest_speed_text "$upload")
+          speed_color=$(speedtest_speed_color "$upload" "不限")
+        fi
+        printf '%b' "$speed_color"; speedtest_pad_left 12 "$upload_text"; printf '%b' "$NC"
+        printf '  '
+        if [ "$download" = "-" ]; then
+          download_tls_text="-"
+        else
+          download_tls_text=$(speedtest_direction_latency_text "$download_tls" "$download")
+        fi
+        if speedtest_metric_failed "$download"; then
+          tls_color="$RED"
+        elif [ "$download_tls" = "-" ]; then
+          if [ "$download" = "-" ]; then
+            tls_color="$DIM"
+          else
+            tls_color="$RED"
+          fi
+        else
+          tls_color=$(speedtest_latency_color "$download_tls")
+        fi
+        printf '%b' "$tls_color"; speedtest_pad_left 10 "$download_tls_text"; printf '%b' "$NC"
+        printf '  '
+        if [ "$upload" = "-" ]; then
+          upload_tls_text="-"
+        else
+          upload_tls_text=$(speedtest_direction_latency_text "$upload_tls" "$upload")
+        fi
+        if speedtest_metric_failed "$upload"; then
+          tls_color="$RED"
+        elif [ "$upload_tls" = "-" ]; then
+          if [ "$upload" = "-" ]; then
+            tls_color="$DIM"
+          else
+            tls_color="$RED"
+          fi
+        else
+          tls_color=$(speedtest_latency_color "$upload_tls")
+        fi
+        printf '%b' "$tls_color"; speedtest_pad_left 10 "$upload_tls_text"; printf '%b' "$NC"
+        printf '\n'
+      done
+      printf '\n'
+      continue
+    fi
+    if [ "$label" = "IPv6" ]; then
+      carriers=(深圳移动 重庆移动)
+      speedtest_print_group_header "IPv6" "IPv6"
+    else
+      carriers=(电信 联通 移动)
+      speedtest_print_group_header "$label" "IPv4"
+    fi
+    if [ "$label" = "IPv6" ]; then
+      results=("$result1" "$result2")
+    else
+      results=("$result1" "$result2" "$result3")
+    fi
     for index in "${!results[@]}"; do
       result="${results[$index]}"
       carrier="${carriers[$index]}"
-      IFS='|' read -r upload retrans download server_id city <<<"$result"
-      region="${city:-$(speedtest_selected_city "$carrier")}${carrier}"
-      [ -n "${city:-$(speedtest_selected_city "$carrier")}" ] || region="${carrier}失败"
+      IFS='|' read -r upload retrans download server_id city upload_connect upload_tls download_connect download_tls <<<"$result"
+      if [ "$label" = "IPv6" ]; then
+        region="${city:-$carrier}"
+      else
+        region="${city:-$(speedtest_selected_city "$carrier")}${carrier}"
+        [ -n "${city:-$(speedtest_selected_city "$carrier")}" ] || region="${carrier}失败"
+      fi
       printf '  '
       printf '%b' "$CYAN"; speedtest_pad_left 12 "$region"; printf '%b' "$NC"
       printf '  '
@@ -3748,34 +5695,86 @@ show_speedtest_results() {
       download_text=$(speedtest_speed_text "$download")
       speed_color=$(speedtest_speed_color "$download" "$label")
       printf '%b' "$speed_color"; speedtest_pad_left 12 "$download_text"; printf '%b' "$NC"
+      printf '  '
+      upload_tls_text=$(speedtest_direction_latency_text "$upload_tls" "$upload")
+      tls_color=$(speedtest_latency_color "$upload_tls")
+      printf '%b' "$tls_color"; speedtest_pad_left 10 "$upload_tls_text"; printf '%b' "$NC"
+      printf '  '
+      download_tls_text=$(speedtest_direction_latency_text "$download_tls" "$download")
+      tls_color=$(speedtest_latency_color "$download_tls")
+      printf '%b' "$tls_color"; speedtest_pad_left 10 "$download_tls_text"; printf '%b' "$NC"
       printf '\n'
     done
     echo
   done
+  echo -e "  ${DIM}注：代理速度由回程速度+下载速度的短板决定。${NC}"
 }
 
 append_speedtest_csv() {
-  local csv="$1" row label result1 result2 result3 result upload retrans download server_id city index carrier
+  local csv="$1" row label result1 result2 result3 result upload retrans download server_id city upload_connect upload_tls download_connect download_tls index carrier
   local carriers=(电信 联通 移动)
   for row in "${SPEEDTEST_ROWS[@]}"; do
     IFS=';' read -r label result1 result2 result3 <<<"$row"
+    if [ "$label" = "IPv6" ]; then
+      for result in "$result1" "$result2"; do
+        [ -n "$result" ] || continue
+        IFS='|' read -r upload retrans download server_id city upload_connect upload_tls download_connect download_tls <<<"$result"
+        city="${city:-IPv6}"
+        if [ "$upload" = "failed" ] || [ "$download" = "failed" ]; then
+          printf '三网单线程速度,%s,%s,%s,,,%s,%s,%s,%s,,,%s,%s,%s,%s\n' \
+            "$label" "$city" "$city" "FAIL" "$upload" "$retrans" "$download" \
+            "${upload_connect:--}" "${upload_tls:--}" "${download_connect:--}" "${download_tls:--}" >> "$csv"
+        else
+          printf '三网单线程速度,%s,%s,%s,%s,,%s,%s,%s,%s,,,%s,%s,%s,%s\n' \
+            "$label" "$city" "$city" "$server_id" \
+            "OK" "$upload" "$retrans" "$download" \
+            "${upload_connect:--}" "${upload_tls:--}" "${download_connect:--}" "${download_tls:--}" >> "$csv"
+        fi
+      done
+      continue
+    fi
+    if [ "$label" = "AppleCDN" ]; then
+      for result in "$result1" "$result2"; do
+        [ -n "$result" ] || continue
+        IFS='|' read -r upload retrans download server_id city upload_connect upload_tls download_connect download_tls <<<"$result"
+        if [ "$upload" = "-" ] && [ "$download" = "-" ]; then
+          printf '三网单线程速度,%s,%s,%s,%s,,%s,%s,%s,%s,,,%s,%s,%s,%s\n' \
+            "$label" "${city:-AppleCDN}" "${city:-AppleCDN}" "${server_id:-$SPEEDTEST_APPLECDN_HOST}" \
+            "SKIP" "$upload" "$retrans" "$download" \
+            "${upload_connect:--}" "${upload_tls:--}" "${download_connect:--}" "${download_tls:--}" >> "$csv"
+        elif [ "$upload" = "failed" ] || [ "$download" = "failed" ]; then
+          printf '三网单线程速度,%s,%s,%s,,,%s,%s,%s,%s,,,%s,%s,%s,%s\n' \
+            "$label" "${city:-AppleCDN}" "${city:-AppleCDN}" "FAIL" "$upload" "$retrans" "$download" \
+            "${upload_connect:--}" "${upload_tls:--}" "${download_connect:--}" "${download_tls:--}" >> "$csv"
+        else
+          printf '三网单线程速度,%s,%s,%s,%s,,%s,%s,%s,%s,,,%s,%s,%s,%s\n' \
+            "$label" "${city:-AppleCDN}" "${city:-AppleCDN}" "${server_id:-$SPEEDTEST_APPLECDN_HOST}" \
+            "OK" "$upload" "$retrans" "$download" \
+            "${upload_connect:--}" "${upload_tls:--}" "${download_connect:--}" "${download_tls:--}" >> "$csv"
+        fi
+      done
+      continue
+    fi
     index=0
     for result in "$result1" "$result2" "$result3"; do
       carrier="${carriers[$index]}"
-      IFS='|' read -r upload retrans download server_id city <<<"$result"
+      IFS='|' read -r upload retrans download server_id city upload_connect upload_tls download_connect download_tls <<<"$result"
       city="${city:-$(speedtest_selected_city "$carrier")}"
       server_id="${server_id:-$(speedtest_selected_id "$carrier")}"
-      if [ "$upload" = "failed" ]; then
-        printf '三网单线程速度,%s,%s,%s,,,%s,%s,%s,%s,,\n' \
-          "$label" "$carrier" "$city" "FAIL" "$upload" "$retrans" "$download" >> "$csv"
+      if [ "$upload" = "failed" ] || [ "$download" = "failed" ]; then
+        printf '三网单线程速度,%s,%s,%s,,,%s,%s,%s,%s,,,%s,%s,%s,%s\n' \
+          "$label" "$carrier" "$city" "FAIL" "$upload" "$retrans" "$download" \
+          "${upload_connect:--}" "${upload_tls:--}" "${download_connect:--}" "${download_tls:--}" >> "$csv"
       else
-        printf '三网单线程速度,%s,%s,%s,%s,,%s,%s,%s,%s,,\n' \
+        printf '三网单线程速度,%s,%s,%s,%s,,%s,%s,%s,%s,,,%s,%s,%s,%s\n' \
           "$label" "$carrier" "$city" "$server_id" \
-          "OK" "$upload" "$retrans" "$download" >> "$csv"
+          "OK" "$upload" "$retrans" "$download" \
+          "${upload_connect:--}" "${upload_tls:--}" "${download_connect:--}" "${download_tls:--}" >> "$csv"
       fi
       index=$((index + 1))
     done
   done
+  speedtest_append_tcp_config_csv "$csv"
 }
 
 run_speedtest_mode() {
@@ -3784,7 +5783,7 @@ run_speedtest_mode() {
   report_time=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S CST（北京时间）')
   csv="/tmp/zstatic_nping_$(date +%Y%m%d_%H%M%S).csv"
   printf '\xEF\xBB\xBF' > "$csv"
-  echo "网络,IP版本,省份,运营商,域名,IP,状态,发送,收到,丢包率(%),平均延迟ms,线路" >> "$csv"
+  echo "网络,IP版本,省份,运营商,域名,IP,状态,发送,收到,丢包率(%),平均延迟ms,线路,回程连接耗时ms,回程TLS握手耗时ms,去程连接耗时ms,去程TLS握手耗时ms,iPerf3重传次数,iPerf3方向" >> "$csv"
   append_speedtest_csv "$csv"
   clear
   print_header
@@ -3837,7 +5836,7 @@ main() {
   detect_ip_stack
 
   local ipv4_enabled=0 ipv6_enabled=0 test_cdn=1 normal_cdn_enabled=1 test_edu=0 want_ipv4=1 want_ipv6=1
-  local large_packet_enabled=0 large_packet_probe_enabled=0 large_node_count=0
+  local large_packet_enabled=0 large_packet_route_enabled=0 large_packet_probe_enabled=0 large_node_count=0
   if [ "$TEST_ALL" -eq 1 ]; then
     want_ipv4=1
     want_ipv6=1
@@ -3857,11 +5856,10 @@ main() {
     echo -e "${DIM}[i] 已按参数跳过 IPv4${NC}"
   fi
 
-  if [ "$TEST_CERNET" -eq 1 ] && [ "$TEST_ALL" -eq 0 ]; then
+  if [ "$TEST_CERNET" -eq 1 ] && [ "$TEST_ALL" -eq 0 ] && [ "$INCLUDE_DEFAULT_ROUTE" -eq 0 ]; then
     test_cdn=0
     normal_cdn_enabled=0
     test_edu=1
-    INTERNATIONAL_ENABLED=0
   elif [ "$TEST_CERNET" -eq 1 ] || [ "$TEST_ALL" -eq 1 ]; then
     test_edu=1
   fi
@@ -3887,11 +5885,12 @@ main() {
     large_node_count="$cdn4_node_count"
     if ! check_nexttrace; then
       large_packet_enabled=0
+      large_packet_route_enabled=0
       large_packet_probe_enabled=0
-    elif large_packet_precheck; then
-      large_packet_probe_enabled=1
     else
-      large_packet_probe_enabled=0
+      # IPv4 大包的 nexttrace 属于回程识别；大包 nping 预检延后到路由阶段之后。
+      large_packet_route_enabled=1
+      large_packet_probe_enabled=1
     fi
   fi
 
@@ -3901,8 +5900,7 @@ main() {
   if [ "$ipv4_enabled" -eq 1 ] && [ "$test_edu" -eq 1 ]; then TOTAL=$((TOTAL + cernet_node_count)); fi
   if [ "$want_ipv6" -eq 1 ] && ipv6_available; then
     ipv6_enabled=1
-    ipv6_nping_precheck
-    export IPV6_NPING_FORCE_L2
+    # IPv6 的 nping 预检会产生探测流量，延后到所有回程识别完成后执行。
     if [ "$normal_cdn_enabled" -eq 1 ]; then TOTAL=$((TOTAL + cdn6_node_count)); fi
     if [ "$test_edu" -eq 1 ]; then TOTAL=$((TOTAL + cernet2_node_count)); fi
     echo -e "${GREEN}[√] 检测到可用 IPv6${NC}"
@@ -3921,7 +5919,7 @@ main() {
   fi
   if [ "$INTERNATIONAL_ENABLED" -eq 1 ]; then
     [ "$COUNT_EXPLICIT" -eq 1 ] && INTERNATIONAL_PACKETS="$PACKETS"
-    INTERNATIONAL_PROGRESS_TOTAL=$(international_task_count)
+    INTERNATIONAL_PROGRESS_TOTAL=$(international_total_task_count)
   fi
   local family entry prov isp host fixed_ip port backup_host backup_ip backup_port
   local -a families=()
@@ -3945,22 +5943,43 @@ main() {
   edu_route_labels_v4=$(mktemp)
   edu_route_labels_v6=$(mktemp)
 
-  # 三个阶段严格串行，避免路由与测速流量影响延迟重传结果。
+  # 回程识别先执行；完成后再做延迟/丢包、国际互联和测速，避免前置探测流量影响路由响应。
   SPEEDTEST_PROGRESS_TOTAL=0
   if [ "$SPEEDTEST_ENABLED" -eq 1 ]; then
     SPEEDTEST_PROGRESS_TOTAL=$(($(speedtest_group_count) * 3))
+    if speedtest_applecdn_tests_enabled; then
+      speedtest_applecdn6_tests_enabled || true
+      SPEEDTEST_PROGRESS_TOTAL=$((SPEEDTEST_PROGRESS_TOTAL + $(speedtest_applecdn6_count) + 1))
+      [ "$SPEEDTEST_IPV6_AVAILABLE" -eq 1 ] && SPEEDTEST_PROGRESS_TOTAL=$((SPEEDTEST_PROGRESS_TOTAL + 1))
+    fi
   fi
   if [ "$INTERNATIONAL_ENABLED" -eq 1 ]; then
-    INTERNATIONAL_PROGRESS_TOTAL=$(international_task_count)
+    INTERNATIONAL_PROGRESS_TOTAL=$(international_total_task_count)
   fi
-  if [ "$normal_cdn_enabled" -eq 1 ] || [ "$test_edu" -eq 1 ] || [ "$large_packet_probe_enabled" -eq 1 ]; then
-    set_route_progress_total "$ipv4_enabled" "$ipv6_enabled" "$normal_cdn_enabled" "$test_edu" "$large_packet_probe_enabled"
+  if [ "$normal_cdn_enabled" -eq 1 ] || [ "$test_edu" -eq 1 ] || [ "$large_packet_route_enabled" -eq 1 ]; then
+    set_route_progress_total "$ipv4_enabled" "$ipv6_enabled" "$normal_cdn_enabled" "$test_edu" "$large_packet_route_enabled"
   fi
   echo -e "  ${DIM}正在检测，请稍候...${NC}"
   MULTI_PROGRESS_MODE=1
 
   local idx=0
   show_progress
+
+  # 第一阶段：只做回程路由识别。所有 nping 延迟/丢包探测都在此阶段结束后执行。
+  if [ "$normal_cdn_enabled" -eq 1 ] || [ "$test_edu" -eq 1 ] || [ "$large_packet_route_enabled" -eq 1 ]; then
+    start_route_background "$route_labels_v4" "$route_labels_v6" "$ipv4_enabled" "$ipv6_enabled" "$normal_cdn_enabled" "$test_edu" "$edu_route_labels_v4" "$edu_route_labels_v6" "$route_labels_large_v4" "$large_packet_route_enabled"
+    wait_route_background
+  fi
+
+  # 路由识别结束后，才进行会影响网络响应的预检和延迟/丢包测试。
+  if [ "$ipv6_enabled" -eq 1 ]; then
+    ipv6_nping_precheck
+    export IPV6_NPING_FORCE_L2
+  fi
+  if [ "$large_packet_probe_enabled" -eq 1 ] && ! large_packet_precheck; then
+    large_packet_probe_enabled=0
+  fi
+
   if [ "$normal_cdn_enabled" -eq 1 ]; then
     for family in "${families[@]}"; do
       while IFS='|' read -r prov isp host fixed_ip port backup_host backup_ip backup_port; do
@@ -4028,11 +6047,7 @@ main() {
       i=$((i + 1))
       write_large_skip_result "$prov" "$isp" "$host" "$fixed_ip" "$i"
     done < <(print_cdn_entries 4)
-  fi
-
-  if [ "$normal_cdn_enabled" -eq 1 ] || [ "$test_edu" -eq 1 ] || [ "$large_packet_probe_enabled" -eq 1 ]; then
-    start_route_background "$route_labels_v4" "$route_labels_v6" "$ipv4_enabled" "$ipv6_enabled" "$normal_cdn_enabled" "$test_edu" "$edu_route_labels_v4" "$edu_route_labels_v6" "$route_labels_large_v4" "$large_packet_probe_enabled"
-    wait_route_background
+    show_progress
   fi
   if [ "$INTERNATIONAL_ENABLED" -eq 1 ]; then
     run_international_tests
@@ -4049,7 +6064,7 @@ main() {
   report_time=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S CST（北京时间）')
   local CSV="/tmp/zstatic_nping_$(date +%Y%m%d_%H%M%S).csv"
   printf '\xEF\xBB\xBF' > "$CSV"
-  echo "网络,IP版本,省份,运营商,域名,IP,状态,发送,收到,丢包率(%),平均延迟ms,线路" >> "$CSV"
+  echo "网络,IP版本,省份,运营商,域名,IP,状态,发送,收到,丢包率(%),平均延迟ms,线路,回程连接耗时ms,回程TLS握手耗时ms,去程连接耗时ms,去程TLS握手耗时ms,iPerf3重传次数,iPerf3方向" >> "$CSV"
 
   if [ "$normal_cdn_enabled" -eq 1 ]; then
     for family in "${families[@]}"; do
@@ -4060,6 +6075,7 @@ main() {
         if [ -f "$f" ]; then
           IFS='|' read -r status prov isp host ip snd rcv loss lat < "$f"
           route_label=$(awk -F'|' -v p="$prov" -v i="$isp" '$2 == p && $3 == i { if ($1 == "OK") print $6; else print "Hidden"; exit }' "$route_file")
+          if [ "$status" != "OK" ] && [ "$status" != "SKIP" ]; then route_label="failed"; fi
           echo "三网,IPv${family},$prov,$isp,$host,$ip,$status,$snd,$rcv,$loss,$lat,$route_label" >> "$CSV"
           echo "$status|$prov|$isp|$host|$ip|$snd|$rcv|$loss|$lat" >> "$sorted_file"
         fi
@@ -4076,6 +6092,7 @@ main() {
         route_label="Hidden"
       fi
       route_label=${route_label:-Hidden}
+      if [ "$status" != "OK" ] && [ "$status" != "SKIP" ]; then route_label="failed"; fi
       echo "IPv4大包,IPv4,$prov,$isp,$host,$ip,$status,$snd,$rcv,$loss,$lat,$route_label" >> "$CSV"
       echo "$status|$prov|$isp|$host|$ip|$snd|$rcv|$loss|$lat" >> "$sorted_large_v4"
     done < <(find "$RESULT_DIR" -maxdepth 1 -type f -name 'large4_[0-9]*' | awk -F_ '{ print $NF "|" $0 }' | sort -t'|' -k1,1n | cut -d'|' -f2-)
@@ -4087,6 +6104,7 @@ main() {
         IFS='|' read -r status prov isp host ip snd rcv loss lat < "$f"
         route_label=$(awk -F'|' -v p="$prov" '$2 == p { if ($1 == "OK") print $6; else print "Hidden"; exit }' "$edu_route_labels_v4")
         route_label=${route_label:-Hidden}
+        if [ "$status" != "OK" ] && [ "$status" != "SKIP" ]; then route_label="failed"; fi
         echo "CERNET,IPv4,$prov,$isp,$host,$ip,$status,$snd,$rcv,$loss,$lat,$route_label" >> "$CSV"
         echo "$status|$prov|$isp|$host|$ip|$snd|$rcv|$loss|$lat|$route_label" >> "$sorted_cernet"
       fi
@@ -4099,6 +6117,7 @@ main() {
         IFS='|' read -r status prov isp host ip snd rcv loss lat < "$f"
         route_label=$(awk -F'|' -v p="$prov" '$2 == p { if ($1 == "OK") print $6; else print "Hidden"; exit }' "$edu_route_labels_v6")
         route_label=${route_label:-Hidden}
+        if [ "$status" != "OK" ] && [ "$status" != "SKIP" ]; then route_label="failed"; fi
         echo "CERNET2,IPv6,$prov,$isp,$host,$ip,$status,$snd,$rcv,$loss,$lat,$route_label" >> "$CSV"
         echo "$status|$prov|$isp|$host|$ip|$snd|$rcv|$loss|$lat|$route_label" >> "$sorted_cernet2"
       fi
@@ -4106,6 +6125,7 @@ main() {
   fi
   if [ "$INTERNATIONAL_ENABLED" -eq 1 ]; then
     append_international_csv "$CSV"
+    append_international_latency_csv "$CSV"
   fi
   if [ "$SPEEDTEST_ENABLED" -eq 1 ]; then
     append_speedtest_csv "$CSV"
@@ -4157,4 +6177,5 @@ main() {
 }
 
 parse_args "$@"
+apply_auto_parallel
 main
