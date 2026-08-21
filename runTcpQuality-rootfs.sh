@@ -4,7 +4,7 @@
 # remain representative of the VPS. This wrapper never uses proot.
 set -Eeuo pipefail
 
-TCPQUALITY_BUILD_ID="shanghai-menu-v4"
+TCPQUALITY_BUILD_ID="threecity-menu-v10"
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 SELF_SCRIPT="$SCRIPT_DIR/runTcpQuality-rootfs.sh"
@@ -34,7 +34,7 @@ usage() {
 用法:
   sudo ./runTcpQuality-rootfs.sh [选项] [-- 主脚本参数]
 
-不带主脚本参数时，运行“上海三网 TCP 丢包/延迟 + 回程线路 + 国际互连”。
+不带主脚本参数时，运行“北京/上海/广州三网 TCP 丢包/延迟 + 回程线路 + 国际互连”。
 
 选项:
   --distro debian|alpine  rootfs 类型，默认 debian
@@ -137,7 +137,7 @@ if [ "$#" -gt 0 ]; then
   printf " %q" "$@"
   printf "\n"
 else
-  echo "[i] 主脚本参数: 默认上海三网 TCP 丢包/延迟 + 回程线路 + 国际互连"
+  echo "[i] 主脚本参数: 默认北京/上海/广州三网 TCP 丢包/延迟 + 回程线路 + 国际互连"
 fi
 
 
@@ -825,14 +825,14 @@ prepare_guest_files() {
 
   for arg in "$@"; do
     case "$arg" in
-      --route-hops|--route-latency) need_nexttrace=1 ;;
+      --route-hops) need_nexttrace=1 ;;
     esac
   done
   [ "$need_nexttrace" -eq 1 ] || return 0
 
   if [ -x "$ROOTFS_DIR/usr/local/bin/nexttrace-tiny" ] &&
      env -i HOME=/root "PATH=$GUEST_PATH" TERM=dumb chroot "$ROOTFS_DIR" /usr/local/bin/nexttrace-tiny -V >/dev/null 2>&1; then
-    echo "[√] 逐跳路由工具 nexttrace-tiny 已就绪"
+    echo "[√] 逐跳回程 NextTrace/LeoMoeAPI 工具已就绪"
     return 0
   fi
   if download_nexttrace_guest; then
@@ -849,7 +849,7 @@ prepare_guest_files() {
     fi
     rm -f -- "$ROOTFS_DIR/usr/local/bin/nexttrace-tiny"
   fi
-  echo "[!] nexttrace-tiny 不可用；逐跳路由将回退 traceroute，仍显示每跳延迟，但地理位置可能不完整" >&2
+  echo "[!] nexttrace-tiny 不可用；菜单 3 将回退 ICMP traceroute，仍显示每跳延迟，但地理位置/ASN 会减少" >&2
 }
 
 mkdir -p "$OUTPUT_DIR" || die "无法创建输出目录: $OUTPUT_DIR"

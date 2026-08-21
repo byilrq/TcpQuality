@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# TcpQuality 上海三网精简版入口（保留国际互连与回程线路）。
+# TcpQuality 三城市三网精简版入口（北京 / 上海 / 广州，保留国际互连与回程线路）。
 # 旧命令保持不变：
 #   bash <(curl -fsSL https://raw.githubusercontent.com/ibsgss/TcpQuality/main/runTcpQuality.sh)
 #   bash <(curl -fsSL https://tcpquality.ibsgss.uk/run)
@@ -13,7 +13,7 @@
 
 set -Eeuo pipefail
 
-TCPQUALITY_BUILD_ID="shanghai-menu-v4"
+TCPQUALITY_BUILD_ID="threecity-menu-v10"
 
 RAW_BASE="${TCPQUALITY_RAW_BASE:-https://raw.githubusercontent.com/ibsgss/TcpQuality/main}"
 case "$RAW_BASE" in
@@ -62,7 +62,7 @@ usage() {
   --menu               显示交互式测试菜单
 
 主脚本参数:
-  其余参数会原样透传给 runTcpQuality-core.sh。例如 -v4、--speedtest、--route。默认运行含上海三网回程线路与国际互连。
+  其余参数会原样透传给 runTcpQuality-core.sh。例如 -v4、--speedtest、--route。默认交互菜单按项目运行，不会自动全部测试。
 EOF
 }
 
@@ -75,24 +75,33 @@ show_menu() {
   local choice=""
   while true; do
     clear 2>/dev/null || true
-    printf '%s
-'       ''       '============================================================'       '  TcpQuality - 上海三网精简测试菜单'       '============================================================'       '  1. 上海三网 TCP 质量 / 丢包 / 延迟'       '  2. 上海三网 延迟 + 逐跳回程（IPv4）'       '  3. 上海三网 逐跳回程路由（IPv4）'       '     每一跳显示 IP / ASN / 地理位置 / 延迟'       '  4. 国际互联测试'       '  5. 上海三网 单线程测速'       '  6. 全部测试'       '  0. 退出'       '============================================================'       ''
-    printf '请选择 [0-6]: '
+    printf '%s\n' \
+      '' \
+      '============================================================' \
+      '  TcpQuality - 三网精简测试菜单' \
+      '============================================================' \
+      '  1. 三网 TCP 质量 / 丢包 / 延迟' \
+      '  2. 三网 线路类型识别（IPv4）' \
+      '  3. 三网 逐跳回程测试（IPv4）' \
+      '  4. 国际互联测试' \
+      '  5. 三网 单线程测速' \
+      '  0. 退出' \
+      '============================================================' \
+      ''
+    printf '请选择 [0-5]: '
     IFS= read -r choice || exit 1
     case "$choice" in
       1) CORE_ARGS=(--only-domestic-latency); break ;;
-      2) CORE_ARGS=(--route-latency -v4); break ;;
+      2) CORE_ARGS=(--route -v4); break ;;
       3) CORE_ARGS=(--route-hops -v4); break ;;
       4) CORE_ARGS=(--only-intl); break ;;
       5) CORE_ARGS=(--only-speedtest); break ;;
-      6) CORE_ARGS=(); break ;;
       0) exit 0 ;;
-      *) printf '
-[!] 无效选项，请重新选择。
-'; sleep 1 ;;
+      *) printf '\n[!] 无效选项，请重新选择。\n'; sleep 1 ;;
     esac
   done
 }
+
 verify_local_bundle() {
   local f marker="TCPQUALITY_BUILD_ID=\"${TCPQUALITY_BUILD_ID}\""
   for f in "$LOCAL_CORE" "$LOCAL_ROOTFS"; do

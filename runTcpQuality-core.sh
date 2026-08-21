@@ -5,7 +5,7 @@
 
 set -e
 
-TCPQUALITY_BUILD_ID="shanghai-menu-v4"
+TCPQUALITY_BUILD_ID="threecity-menu-v10"
 
 # ===================== NixOS 临时运行环境 =====================
 is_nixos() {
@@ -88,7 +88,6 @@ bootstrap_nixos_environment() {
           "TERM=${TERM:-dumb}" \
           "LANG=${LANG:-C.UTF-8}" \
           "GET_NODES_URL=${GET_NODES_URL:-}" \
-          "TCPQUALITY_REPORT_API=${TCPQUALITY_REPORT_API:-}" \
           TCPQUALITY_NIX_BOOTSTRAPPED=1 \
           "TCPQUALITY_NIX_TEMP_SCRIPT=$1" \
           NIXPKGS_ALLOW_UNFREE=1 \
@@ -99,7 +98,7 @@ bootstrap_nixos_environment() {
 bootstrap_nixos_environment "$@"
 
 # ===================== 颜色定义 =====================
-RED='\033[0;31m';    GREEN='\033[0;32m';    YELLOW='\033[0;33m'
+RED='\033[0;31m';    GREEN='\033[0;32m';    BRIGHT_GREEN='\033[1;92m'; YELLOW='\033[0;33m'
 BLUE='\033[0;34m';   CYAN='\033[0;36m';     MAGENTA='\033[0;35m'
 WHITE='\033[1;37m';  BOLD='\033[1m';        DIM='\033[2m'
 UNDERLINE='\033[4m'
@@ -282,20 +281,19 @@ PARALLEL_EXPLICIT=0
 TEST_CERNET=0
 TEST_ALL=0
 INCLUDE_DEFAULT_ROUTE="${TCPQUALITY_INCLUDE_DEFAULT_ROUTE:-0}"
-UPLOAD_REPORT=1
-REPORT_UPLOAD_FORCED_OFF=0
 ONLY_IPV4=0
 ONLY_IPV6=0
 ONLY_LARGE=0
 ROUTE_MODE=0
 ROUTE_HOPS_MODE=0
-ROUTE_HOPS_AFTER=0
 ROUTE_PROTOCOL="tcp"
 ROUTE_ACTIVE_PREFIX=""
 DOMESTIC_ROUTE_ENABLED=1
-DOMESTIC_PROVINCE="上海"
-# 精简版固定只检测上海三网，避免默认全国节点探测带来的额外流量。
-SELECTED_PROVINCES="|${DOMESTIC_PROVINCE}|"
+DOMESTIC_NODE_LIMIT=1
+# 节点源使用省级名称：广州节点通常标记为“广东”；界面统一显示“广州”。
+DOMESTIC_PROVINCES=("北京" "上海" "广东")
+# 所有国内菜单每城市每运营商取 1 节点；逐跳回程因此每个运营商共 3 节点（京/沪/穗各 1），总计最多 9 条。
+SELECTED_PROVINCES="|北京|上海|广东|"
 DEBUG_MODE=0
 SPEEDTEST_ENABLED=0
 SPEEDTEST_ONLY=0
@@ -324,9 +322,7 @@ PROGRESS_LINES_PRINTED=0
 PROGRESS_LAST_STATE=""
 PROGRESS_LAST_TS=0
 PROGRESS_MIN_INTERVAL=1
-REPORT_API=${TCPQUALITY_REPORT_API:-https://tcpquality.ibsgss.uk/generate}
-ROUTE_ASN_API=${TCPQUALITY_ROUTE_ASN_API:-${REPORT_API%/generate}/route/asn?format=tsv}
-RANK_SESSION_API=${TCPQUALITY_RANK_SESSION_API:-${REPORT_API%/generate}/rank/session}
+ROUTE_ASN_API=${TCPQUALITY_ROUTE_ASN_API:-https://tcpquality.ibsgss.uk/route/asn?format=tsv}
 RANK_SESSION_ID=""
 RANK_SESSION_TOKEN=""
 RANK_SESSION_STARTED_AT=""
@@ -467,9 +463,17 @@ province_from_code() {
 add_province_filter() {
   local province
   province=$(province_from_code "$1") || return 1
-  # 上海精简版不允许通过参数重新加入其它省份。
-  [ "$province" = "$DOMESTIC_PROVINCE" ] || return 1
-  SELECTED_PROVINCES="|${DOMESTIC_PROVINCE}|"
+  case "$province" in
+    北京|上海|广东) SELECTED_PROVINCES="|${province}|" ;;
+    *) return 1 ;;
+  esac
+}
+
+city_display_name() {
+  case "$1" in
+    广东) printf '广州' ;;
+    *) printf '%s' "$1" ;;
+  esac
 }
 
 province_selected() {
@@ -481,7 +485,7 @@ province_filter_text() {
   if [ -z "$SELECTED_PROVINCES" ]; then
     echo "全国"
   else
-    printf "%s" "$SELECTED_PROVINCES" | sed 's/^|//; s/|$//; s/||/、/g; s/|/、/g'
+    printf "%s" "$SELECTED_PROVINCES" | sed 's/^|//; s/|$//; s/||/、/g; s/|/、/g; s/广东/广州/g'
   fi
 }
 
@@ -519,7 +523,7 @@ count_cernet2_nodes() {
 }
 
 node_scope() {
-  # 上海精简版只向节点服务请求三网 CDN；不请求教育网/全国节点。
+  # 三城市精简版只向节点服务请求三网 CDN；不请求教育网/全国线路集合。
   if [ "$ONLY_IPV4" -eq 1 ] && [ "$ONLY_IPV6" -eq 0 ]; then
     echo "v4"
   elif [ "$ONLY_IPV6" -eq 1 ] && [ "$ONLY_IPV4" -eq 0 ]; then
@@ -531,7 +535,7 @@ node_scope() {
 
 load_remote_nodes() {
   local scope="${1:-$(node_scope)}"
-  local tmp err line type family prov isp host ip port target backup_host backup_ip backup_port backup_target url sep curl_status
+  local tmp err line type family prov isp host ip port target backup_host backup_ip backup_port backup_target url sep curl_status node_key count_key count_value seen_node_keys="|"
   command -v curl &>/dev/null || return 1
   tmp=$(mktemp)
   err="${tmp}.err"
@@ -554,30 +558,29 @@ load_remote_nodes() {
   REMOTE_CDN6_NODES=()
   REMOTE_CERNET_NODES=()
   REMOTE_CERNET2_NODES=()
-  local seen_4_ct=0 seen_4_cu=0 seen_4_cm=0 seen_6_ct=0 seen_6_cu=0 seen_6_cm=0
+  declare -A node_counts=()
 
   while IFS= read -r line; do
     line=${line//$'\t'/'|'}
     IFS='|' read -r type family prov isp host ip port target backup_host backup_ip backup_port backup_target <<< "$line"
     [ "$type" = "type" ] && continue
     [ -n "$ip" ] || continue
-    # 国内部分严格限定：上海 + 电信/联通/移动 + 每协议每运营商只取 1 个节点。
+    # 国内部分严格限定：北京 / 上海 / 广州（节点源为广东）+ 电信/联通/移动。
     [ "$type" = "cdn" ] || continue
-    [ "$prov" = "$DOMESTIC_PROVINCE" ] || continue
+    province_selected "$prov" || continue
     case "$isp" in
       电信|联通|移动) ;;
       *) continue ;;
     esac
     port=${port:-80}
-    case "$family:$isp" in
-      4:电信) [ "$seen_4_ct" -eq 0 ] || continue; seen_4_ct=1 ;;
-      4:联通) [ "$seen_4_cu" -eq 0 ] || continue; seen_4_cu=1 ;;
-      4:移动) [ "$seen_4_cm" -eq 0 ] || continue; seen_4_cm=1 ;;
-      6:电信) [ "$seen_6_ct" -eq 0 ] || continue; seen_6_ct=1 ;;
-      6:联通) [ "$seen_6_cu" -eq 0 ] || continue; seen_6_cu=1 ;;
-      6:移动) [ "$seen_6_cm" -eq 0 ] || continue; seen_6_cm=1 ;;
-      *) continue ;;
-    esac
+    node_key="${family}:${prov}:${isp}:${ip}"
+    [[ "$seen_node_keys" == *"|${node_key}|"* ]] && continue
+    seen_node_keys+="${node_key}|"
+    case "$family" in 4|6) ;; *) continue ;; esac
+    count_key="${family}:${prov}:${isp}"
+    count_value=${node_counts[$count_key]:-0}
+    [ "$count_value" -lt "$DOMESTIC_NODE_LIMIT" ] || continue
+    node_counts[$count_key]=$((count_value + 1))
     case "$family" in
       4) REMOTE_CDN4_NODES+=("$prov|$isp|$host|$ip|$port|$backup_host|$backup_ip|${backup_port:-80}") ;;
       6) REMOTE_CDN6_NODES+=("$prov|$isp|$host|$ip|$port|$backup_host|$backup_ip|${backup_port:-80}") ;;
@@ -605,14 +608,23 @@ require_remote_nodes() {
 }
 
 print_cdn_entries() {
-  local family="$1" entry prov isp host port
+  local family="$1" entry prov isp host fixed_ip port backup_host backup_ip backup_port wanted_prov wanted_isp
   local -a remote_nodes=()
   if [ "$family" = "6" ]; then
     remote_nodes=("${REMOTE_CDN6_NODES[@]}")
   else
     remote_nodes=("${REMOTE_CDN4_NODES[@]}")
   fi
-  printf "%s\n" "${remote_nodes[@]}"
+  # 固定展示顺序：北京 -> 上海 -> 广州；每城市电信 -> 联通 -> 移动。
+  for wanted_prov in 北京 上海 广东; do
+    province_selected "$wanted_prov" || continue
+    for wanted_isp in 电信 联通 移动; do
+      for entry in "${remote_nodes[@]}"; do
+        IFS='|' read -r prov isp host fixed_ip port backup_host backup_ip backup_port <<< "$entry"
+        [ "$prov" = "$wanted_prov" ] && [ "$isp" = "$wanted_isp" ] && printf '%s\n' "$entry"
+      done
+    done
+  done
 }
 
 print_cernet_entries() {
@@ -628,38 +640,37 @@ print_cernet2_entries() {
 # ===================== 参数与帮助 =====================
 show_help() {
   cat <<EOF
-TcpQuality 上海三网精简版（保留国际互连 + 回程线路）
+TcpQuality 三城市三网精简版（北京 / 上海 / 广州；保留国际互连 + 回程线路）
 
 用法:
   bash runTcpQuality.sh [选项]
 
 默认执行：
-  1. 上海电信 / 联通 / 移动各 1 个节点的 TCP SYN 丢包与延迟
-  2. 同一批上海三网节点的 TCP traceroute 回程线路识别
+  1. 北京 / 上海 / 广州三地，电信 / 联通 / 移动各 1 个节点的 TCP SYN 丢包与延迟
+  2. 同一批三城市三网节点的 TCP traceroute 回程线路识别
   3. 国际网站 / CDN TCP 互连与国际 iPerf3 双向测试
   IPv4/IPv6 可用时分别测试；不会请求全国节点、教育网或 IPv4 大包测试。
 
 选项:
   -h, --help        显示帮助信息并退出
-  -c, --count NUM   每个上海三网节点发包数，范围 1-${MAX_PACKETS}，默认 ${PACKETS}
+  -c, --count NUM   每个三网节点发包数，范围 1-${MAX_PACKETS}，默认 ${PACKETS}
   -s, --size NUM    指定 IP 包总长度（单位 B），0 为标准无负载 SYN；默认 0
   -p, --parallel NUM
                      并行数，范围 1-31；精简版自动并行上限为 6
   -v4, --v4         国内三网仅测试 IPv4（国际互连仍使用可用 IPv4）
   -v6, --v6         国内三网仅测试 IPv6；无 IPv4 时自动跳过国际互连
-  --only-domestic  仅测上海三网 TCP 质量/延迟 + 回程路由
+  --only-domestic  仅测北京/上海/广州三网 TCP 质量/延迟 + 回程路由
   --only-domestic-latency
-                     仅测上海三网 TCP 丢包与延迟，不跑 traceroute
+                     仅测北京/上海/广州三网 TCP 丢包与延迟，不跑 traceroute
   --only-intl       仅测国际网站/CDN 与国际 iPerf3 互联
-  --route           兼容旧模式：上海三网回程线路类型汇总
-  --route-hops      上海三网逐跳回程：每跳显示 IP / ASN / 地理位置 / 延迟
-  --route-latency   上海三网 TCP 丢包/延迟 + 逐跳回程（不跑国际）
+  --route           三城市三网线路类型识别（每城市每网 1 节点，输出 163 / 4837 / CMI 等）
+  --route-hops      三城市三网逐跳回程（固定 BestTrace 常用 9 目标；NextTrace + LeoMoeAPI + ICMP；简短中文位置 / 绿色延迟）
   --route-protocol PROTO
                      traceroute 协议: tcp、udp、both，默认 tcp
-  --speedtest       在默认测试后追加上海三网单线程测速
-  --only-speedtest  仅运行上海三网单线程测速
+  --speedtest       在默认测试后追加北京/上海/广州三网单线程测速
+  --only-speedtest  仅运行北京/上海/广州三网单线程测速
   --intl            兼容参数；国际互连已默认启用
-  --no-rank-upload  不上传报告，也不参与速度排名
+  --no-rank-upload  兼容参数；本精简版始终不上传报告/排名
   --debug           保留临时文件并输出调试信息
 
 低流量默认：
@@ -706,9 +717,8 @@ parse_args() {
       --only-domestic) INTERNATIONAL_ENABLED=0; DOMESTIC_ROUTE_ENABLED=1; shift ;;
       --only-domestic-latency) INTERNATIONAL_ENABLED=0; DOMESTIC_ROUTE_ENABLED=0; shift ;;
       --only-intl) INTERNATIONAL_ENABLED=1; INTERNATIONAL_ONLY=1; shift ;;
-      --route) ROUTE_MODE=1; UPLOAD_REPORT=0; shift ;;
-      --route-hops) ROUTE_HOPS_MODE=1; UPLOAD_REPORT=0; INTERNATIONAL_ENABLED=0; shift ;;
-      --route-latency) INTERNATIONAL_ENABLED=0; DOMESTIC_ROUTE_ENABLED=0; ROUTE_HOPS_AFTER=1; UPLOAD_REPORT=0; shift ;;
+      --route) ROUTE_MODE=1; shift ;;
+      --route-hops) ROUTE_HOPS_MODE=1; DOMESTIC_NODE_LIMIT=1; INTERNATIONAL_ENABLED=0; shift ;;
       --route-protocol)
         if [ -z "${2:-}" ] || { [ "$2" != "tcp" ] && [ "$2" != "udp" ] && [ "$2" != "both" ]; }; then
           echo -e "${RED}[X] --route-protocol 只支持 tcp、udp、both${NC}" >&2
@@ -719,15 +729,17 @@ parse_args() {
       --speedtest) SPEEDTEST_ENABLED=1; shift ;;
       --only-speedtest) SPEEDTEST_ENABLED=1; SPEEDTEST_ONLY=1; INTERNATIONAL_ENABLED=0; shift ;;
       --intl) INTERNATIONAL_ENABLED=1; shift ;;
-      --no-rank-upload) UPLOAD_REPORT=0; REPORT_UPLOAD_FORCED_OFF=1; shift ;;
+      --no-rank-upload) shift ;;
       --debug) DEBUG_MODE=1; shift ;;
       --province)
-        if [ "${2:-}" != "sh" ] && [ "${2:-}" != "上海" ]; then
-          echo -e "${RED}[X] 精简版固定上海，不支持其它省份${NC}" >&2; exit 1
+        if [ -z "${2:-}" ] || ! add_province_filter "$2"; then
+          echo -e "${RED}[X] 精简版仅支持北京(bj)、上海(sh)、广州/广东(gd)${NC}" >&2; exit 1
         fi
         shift 2
         ;;
-      -sh) shift ;;
+      -bj) SELECTED_PROVINCES="|北京|"; shift ;;
+      -sh) SELECTED_PROVINCES="|上海|"; shift ;;
+      -gd) SELECTED_PROVINCES="|广东|"; shift ;;
       --cernet|--all|--only-large)
         echo -e "${RED}[X] 精简版已移除全国/教育网/IPv4大包入口: $1${NC}" >&2
         exit 1
@@ -1031,6 +1043,7 @@ show_provider_summary() {
     if (pad < 0) pad = 0
     return text spaces(pad)
   }
+  function display_prov(p) { return p == "广东" ? "广州" : p }
   function format_summary_cell(label, latency, loss, latency_color_value, loss_color_value) {
     return white sprintf("%" route_w "s", label) nc " " latency_color_value sprintf("%" latency_w "s", latency) nc " " loss_color_value sprintf("%" loss_w "s", loss) nc
   }
@@ -1086,7 +1099,7 @@ show_provider_summary() {
     printf "  %s%s%s%s  %s%s%s %s/ %s%s%s %s/ %s%s%s\n", bold, cyan, label_cell("三网概览"), nc, cyan, header_align_latency("电信"), nc, white, cyan, header_align_latency("联通"), nc, white, cyan, header_align_latency("移动"), nc
     for (i = 1; i <= n; i++) {
       prov = order[i]
-      printf "  %s%s%s  %s %s/ %s %s/ %s\n", cyan, label_cell(prov), nc, data[prov SUBSEP "电信"], white, data[prov SUBSEP "联通"], white, data[prov SUBSEP "移动"]
+      printf "  %s%s%s  %s %s/ %s %s/ %s\n", cyan, label_cell(display_prov(prov)), nc, data[prov SUBSEP "电信"], white, data[prov SUBSEP "联通"], white, data[prov SUBSEP "移动"]
     }
     printf "  %s颜色: %s正常%s  %s延迟151-240ms或1-20%%重传%s  %s延迟>240ms或>20%%重传，或失败%s\n\n", dim, green, dim, yellow, dim, red, nc
   }' "${route_file:-/dev/null}" "$file"
@@ -1515,241 +1528,6 @@ detect_ip_stack() {
 
 ipv4_available() {
   [ "$IPV4_WORK" -eq 1 ]
-}
-
-report_api_base() {
-  printf '%s' "${REPORT_API%/generate}"
-}
-
-ensure_public_ips_for_rank() {
-  if [ -z "${IPV4_PUBLIC:-}" ]; then
-    get_public_ipv4 || true
-  fi
-  if [ -z "${IPV6_PUBLIC:-}" ]; then
-    get_public_ipv6 || true
-  fi
-}
-
-upload_route_trace_bundle() {
-  local report_id="$1" section="$2" prefix="$3" trace_glob bundle list_file manifest_file response_file endpoint http_code count
-  trace_glob="$RESULT_DIR/${prefix}_trace_*"
-  compgen -G "$trace_glob" >/dev/null || return 0
-  command -v tar >/dev/null 2>&1 || return 0
-  command -v curl >/dev/null 2>&1 || return 0
-
-  bundle=$(mktemp "${TMPDIR:-/tmp}/tcpquality-${section}.XXXXXX.tar.gz") || return 0
-  list_file=$(mktemp "${TMPDIR:-/tmp}/tcpquality-${section}.XXXXXX.list") || {
-    rm -f "$bundle"
-    return 0
-  }
-  manifest_file="$RESULT_DIR/${prefix}_trace_manifest.json"
-  count=$(find "$RESULT_DIR" -maxdepth 1 -type f -name "${prefix}_trace_*" | wc -l | tr -d ' ')
-  printf '{"reportId":"%s","section":"%s","prefix":"%s","generatedAt":"%s","traceFiles":%s}\n' \
-    "$report_id" "$section" "$prefix" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${count:-0}" > "$manifest_file"
-  find "$RESULT_DIR" -maxdepth 1 -type f -name "${prefix}_trace_*" -exec basename {} \; > "$list_file"
-  basename "$manifest_file" >> "$list_file"
-  if ! tar -C "$RESULT_DIR" -czf "$bundle" -T "$list_file" 2>/dev/null; then
-    rm -f "$bundle" "$list_file"
-    return 0
-  fi
-
-  response_file=$(mktemp)
-  endpoint="$(report_api_base)/route-traces/${report_id}.${section}.tar.gz"
-  if http_code=$(curl -4 -sS --connect-timeout 10 --max-time 30 --retry 2 \
-    -o "$response_file" -w '%{http_code}' \
-    -H 'Content-Type: application/gzip' \
-    --data-binary "@$bundle" "$endpoint" 2>/dev/null); then
-    if [ "$DEBUG_MODE" -eq 1 ]; then
-      printf '%s\n' "$http_code" > "$RESULT_DIR/route_trace_${section}_upload_http_code.txt"
-      cp "$response_file" "$RESULT_DIR/route_trace_${section}_upload_response.json" 2>/dev/null || true
-    fi
-  elif [ "$DEBUG_MODE" -eq 1 ]; then
-    printf '%s\n' "curl_failed" > "$RESULT_DIR/route_trace_${section}_upload_http_code.txt"
-  fi
-  rm -f "$bundle" "$list_file" "$response_file"
-}
-
-upload_route_trace_bundles() {
-  local report_id="$1"
-  [ -n "$report_id" ] || return 0
-  upload_route_trace_bundle "$report_id" "ipv4" "summary_route4"
-  upload_route_trace_bundle "$report_id" "ipv4_large" "summary_large_route4"
-  upload_route_trace_bundle "$report_id" "ipv6" "summary_route6"
-  upload_route_trace_bundle "$report_id" "cernet_ipv4" "edu_route4"
-  upload_route_trace_bundle "$report_id" "cernet2_ipv6" "edu_route6"
-}
-
-upload_speedtest_debug_bundle() {
-  local report_id="$1" debug_dir="$RESULT_DIR/speedtest-debug" bundle response_file endpoint http_code
-  [ -n "$report_id" ] || return 0
-  [ -d "$debug_dir" ] || return 0
-  find "$debug_dir" -type f | grep -q . || return 0
-  command -v tar >/dev/null 2>&1 || return 0
-  command -v curl >/dev/null 2>&1 || return 0
-
-  printf '{"reportId":"%s","generatedAt":"%s","type":"speedtest-debug"}\n' \
-    "$report_id" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$debug_dir/manifest.json"
-  bundle=$(mktemp "${TMPDIR:-/tmp}/tcpquality-speedtest-debug.XXXXXX.tar.gz") || return 0
-  if ! tar -C "$debug_dir" -czf "$bundle" . 2>/dev/null; then
-    rm -f "$bundle"
-    return 0
-  fi
-
-  response_file=$(mktemp)
-  endpoint="$(report_api_base)/speedtest-debug/${report_id}.tar.gz"
-  if http_code=$(curl -4 -sS --connect-timeout 10 --max-time 30 --retry 2 \
-    -o "$response_file" -w '%{http_code}' \
-    -H 'Content-Type: application/gzip' \
-    --data-binary "@$bundle" "$endpoint" 2>/dev/null); then
-    if [ "$DEBUG_MODE" -eq 1 ]; then
-      printf '%s\n' "$http_code" > "$RESULT_DIR/speedtest_debug_upload_http_code.txt"
-      cp "$response_file" "$RESULT_DIR/speedtest_debug_upload_response.json" 2>/dev/null || true
-    fi
-  elif [ "$DEBUG_MODE" -eq 1 ]; then
-    printf '%s\n' "curl_failed" > "$RESULT_DIR/speedtest_debug_upload_http_code.txt"
-  fi
-  rm -f "$bundle" "$response_file"
-}
-
-upload_probe_debug_bundle() {
-  local report_id="$1" bundle list_file response_file endpoint http_code count
-  [ "${DEBUG_MODE:-0}" -eq 1 ] || return 0
-  [ -n "$report_id" ] || return 0
-  command -v tar >/dev/null 2>&1 || return 0
-  command -v curl >/dev/null 2>&1 || return 0
-
-  list_file=$(mktemp "${TMPDIR:-/tmp}/tcpquality-probe-debug.XXXXXX.list") || return 0
-  {
-    find "$RESULT_DIR" -maxdepth 1 -type f \
-      \( -name 'nping_*.log' \
-        -o -name 'nping_*_meta.txt' \
-        -o -name 'backup_retry_meta.txt' \
-        -o -name 'route_debug_meta.txt' \
-        -o -name 'report_upload.csv' \
-        -o -name 'report_upload*.json' \
-        -o -name 'report_upload*.txt' \
-        -o -name 'route_trace_*_upload*.json' \
-        -o -name 'route_trace_*_upload*.txt' \
-        -o -name 'speedtest_debug_upload*.json' \
-        -o -name 'speedtest_debug_upload*.txt' \
-        -o -name 'speedtest.log' \
-        -o -name 'speedtest.progress' \
-        -o -name 'speedtest.state' \
-        -o -name 'internet_*.ips' \
-        -o -name 'internet_*.http' \) \
-      -exec basename {} \;
-    find "$RESULT_DIR" -maxdepth 2 -type f -path '*/speedtest.*/*' \
-      | sed "s#^$RESULT_DIR/##"
-  } | sort -u > "$list_file"
-  count=$(wc -l < "$list_file" | tr -d ' ')
-  [ "${count:-0}" -gt 0 ] 2>/dev/null || {
-    rm -f "$list_file"
-    return 0
-  }
-
-  printf '{"reportId":"%s","generatedAt":"%s","type":"probe-debug","files":%s}\n' \
-    "$report_id" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "${count:-0}" > "$RESULT_DIR/probe_debug_manifest.json"
-  printf '%s\n' "probe_debug_manifest.json" >> "$list_file"
-
-  bundle=$(mktemp "${TMPDIR:-/tmp}/tcpquality-probe-debug.XXXXXX.tar.gz") || {
-    rm -f "$list_file"
-    return 0
-  }
-  if ! tar -C "$RESULT_DIR" -czf "$bundle" -T "$list_file" 2>/dev/null; then
-    rm -f "$bundle" "$list_file"
-    return 0
-  fi
-
-  response_file=$(mktemp)
-  endpoint="$(report_api_base)/probe-debug/${report_id}.tar.gz"
-  if http_code=$(curl -4 -sS --connect-timeout 10 --max-time 30 --retry 2 \
-    -o "$response_file" -w '%{http_code}' \
-    -H 'Content-Type: application/gzip' \
-    --data-binary "@$bundle" "$endpoint" 2>/dev/null); then
-    printf '%s\n' "$http_code" > "$RESULT_DIR/probe_debug_upload_http_code.txt"
-    cp "$response_file" "$RESULT_DIR/probe_debug_upload_response.json" 2>/dev/null || true
-  else
-    printf '%s\n' "curl_failed" > "$RESULT_DIR/probe_debug_upload_http_code.txt"
-  fi
-  rm -f "$bundle" "$list_file" "$response_file"
-}
-
-upload_report() {
-  local csv="$1" report_time="${2:-}" response_file curl_err http_code report_id report_url today_uses total_uses rank_updated rank_reject_reason rank_finished_at
-  local rank_headers=()
-  if ! command -v curl &>/dev/null; then
-    echo -e "  ${YELLOW}[!] 依赖不完整，已跳过 SVG 报告上传${NC}"
-    return
-  fi
-  if grep -qE '^(Speedtest|三网单线程速度),' "$csv" 2>/dev/null; then
-    ensure_public_ips_for_rank
-  fi
-  if [ -n "${RANK_SESSION_ID:-}" ] && [ -n "${RANK_SESSION_TOKEN:-}" ]; then
-    rank_headers+=(-H "X-TcpQuality-Rank-Session: $RANK_SESSION_ID")
-    rank_headers+=(-H "X-TcpQuality-Rank-Token: $RANK_SESSION_TOKEN")
-    rank_headers+=(-H "X-TcpQuality-Rank-Started-At: ${RANK_SESSION_STARTED_AT:-}")
-    rank_headers+=(-H "X-TcpQuality-Rank-Expires-At: ${RANK_SESSION_EXPIRES_AT:-}")
-    rank_headers+=(-H "X-TcpQuality-Rank-Session-IPv4: ${RANK_SESSION_IP4:-}")
-  fi
-  if [ -n "${SPEEDTEST_RANK_DISABLED_REASON:-}" ]; then
-    rank_headers+=(-H "X-TcpQuality-Rank-Disabled-Reason: $SPEEDTEST_RANK_DISABLED_REASON")
-  fi
-
-  response_file=$(mktemp)
-  curl_err=$(mktemp)
-  if [ "$DEBUG_MODE" -eq 1 ] && [ -f "$csv" ]; then
-    cp "$csv" "$RESULT_DIR/report_upload.csv" 2>/dev/null || true
-  fi
-  rank_finished_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-  if ! http_code=$(curl -4 -sS --connect-timeout 10 --max-time 30 --retry 2 \
-    -o "$response_file" -w '%{http_code}' \
-    -H 'Content-Type: text/csv; charset=utf-8' \
-    -H "X-Report-Time: $report_time" \
-    -H "X-TcpQuality-Public-IPv4: ${IPV4_PUBLIC:-}" \
-    -H "X-TcpQuality-Public-IPv6: ${IPV6_PUBLIC:-}" \
-    -H "X-TcpQuality-Rank-Finished-At: $rank_finished_at" \
-    "${rank_headers[@]}" \
-    --data-binary "@$csv" "$REPORT_API" 2>"$curl_err"); then
-    echo -e "  ${YELLOW}[!] SVG 报告上传失败，本地 CSV 已保留${NC}"
-    if [ "$DEBUG_MODE" -eq 1 ]; then
-      cp "$response_file" "$RESULT_DIR/report_upload_response.json" 2>/dev/null || true
-      cp "$curl_err" "$RESULT_DIR/report_upload_curl.err" 2>/dev/null || true
-      printf '%s\n' "curl_failed" > "$RESULT_DIR/report_upload_http_code.txt"
-    fi
-    rm -f "$response_file" "$curl_err"
-    return
-  fi
-  rm -f "$curl_err"
-  if [ "$DEBUG_MODE" -eq 1 ]; then
-    cp "$response_file" "$RESULT_DIR/report_upload_response.json" 2>/dev/null || true
-    printf '%s\n' "$http_code" > "$RESULT_DIR/report_upload_http_code.txt"
-  fi
-
-  if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
-    report_id=$(sed -nE 's/.*"id":"([^"]+)".*/\1/p' "$response_file" | head -1)
-    report_url=$(sed -nE 's/.*"url":"([^"]+)".*/\1/p' "$response_file" | head -1)
-    today_uses=$(sed -nE 's/.*"todayUses":([0-9]+).*/\1/p' "$response_file" | head -1)
-    total_uses=$(sed -nE 's/.*"totalUses":([0-9]+).*/\1/p' "$response_file" | head -1)
-    rank_updated=$(sed -nE 's/.*"rankUpdated":(true|false).*/\1/p' "$response_file" | head -1)
-    rank_reject_reason=$(sed -nE 's/.*"rankRejectReason":"([^"]*)".*/\1/p' "$response_file" | head -1)
-  fi
-  if [ -n "$report_id" ]; then
-    upload_route_trace_bundles "$report_id"
-    upload_speedtest_debug_bundle "$report_id"
-    upload_probe_debug_bundle "$report_id"
-  fi
-  if [ -n "$report_url" ]; then
-    echo -e "  ${WHITE}报告链接：${UNDERLINE}${report_url}${NC}"
-    if [ -n "$today_uses" ] && [ -n "$total_uses" ]; then
-      echo -e "  ${DIM}今日TCP脚本使用次数：${today_uses}；总使用次数：${total_uses}。感谢使用ibsgss网络质量检测脚本！${NC}"
-    fi
-    if [ "$DEBUG_MODE" -eq 1 ] && [ "$rank_updated" = "false" ] && [ -n "$rank_reject_reason" ]; then
-      echo -e "  ${YELLOW}[!] 排名未更新：${rank_reject_reason}${NC}"
-    fi
-  else
-    echo -e "  ${YELLOW}[!] SVG 报告上传失败（HTTP $http_code），本地 CSV 已保留${NC}"
-  fi
-  rm -f "$response_file"
 }
 
 # ===================== 三网回程线路识别 =====================
@@ -2487,6 +2265,7 @@ show_route_results() {
       c = color(status, label)
       return c sprintf("%-11s", label) nc
     }
+    function display_prov(p) { return p == "广东" ? "广州" : p }
     {
       status = $1
       prov = $2
@@ -2512,8 +2291,9 @@ show_route_results() {
         printf "  %s%s%s 回程线路%s %s(-- 电信 -- | -- 联通 -- | -- 移动 --)%s\n", bold, cyan, proto, nc, dim, nc
         for (i = 1; i <= n; i++) {
           prov = order[i]
-          prov_pad = (prov == "黑龙江" || prov == "内蒙古") ? "  " : "    "
-          printf "  %s%s%s%s  %s  %s  %s\n", cyan, prov, nc, prov_pad, result[proto SUBSEP prov SUBSEP "电信"], result[proto SUBSEP prov SUBSEP "联通"], result[proto SUBSEP prov SUBSEP "移动"]
+          display = display_prov(prov)
+          prov_pad = (display == "黑龙江" || display == "内蒙古") ? "  " : "    "
+          printf "  %s%s%s%s  %s  %s  %s\n", cyan, display, nc, prov_pad, result[proto SUBSEP prov SUBSEP "电信"], result[proto SUBSEP prov SUBSEP "联通"], result[proto SUBSEP prov SUBSEP "移动"]
         }
         printf "\n"
       }
@@ -2640,65 +2420,316 @@ run_route_mode() {
 }
 
 
-run_route_hops_one() {
-  local family="$1" isp="$2" host="$3" target_ip="$4" port="${5:-80}" fam_flag="-4" output rc
-  [ "$family" = "6" ] && fam_flag="-6"
-  echo -e "${BOLD}${CYAN}  上海${isp} IPv${family}${NC}  ${DIM}${host} -> ${target_ip}:${port}${NC}"
-  echo -e "${DIM}  每一跳显示路由 IP、ASN/运营商、地理位置及 RTT；* 表示该跳未回应。${NC}"
-  echo
+compact_route_location() {
+  local raw="$1" lower
+  lower=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
+  case "$lower" in
+    *hong\ kong*|*香港*) echo "HK 香港" ;;
+    *beijing*|*jinrongjie*|*北京*) echo "CN 北京" ;;
+    *shanghai*|*上海*) echo "CN 上海" ;;
+    *guangzhou*|*guangdong*|*广州*|*广东*) echo "CN 广州" ;;
+    *tokyo*|*minato*|*chiyoda*|*东京*) echo "JP 东京" ;;
+    *osaka*|*大阪*) echo "JP 大阪" ;;
+    *los\ angeles*|*losangeles*|*洛杉矶*) echo "US 洛杉矶" ;;
+    *san\ jose*|*sanjose*|*圣何塞*) echo "US 圣何塞" ;;
+    *seattle*|*西雅图*) echo "US 西雅图" ;;
+    *singapore*|*新加坡*) echo "SG 新加坡" ;;
+    *taiwan*|*台湾*) echo "TW 台湾" ;;
+    *south\ korea*|*korea*|*韩国*) echo "KR 韩国" ;;
+    *united\ states*|*usa*|*美国*) echo "US" ;;
+    *germany*|*德国*) echo "DE" ;;
+    *netherlands*|*荷兰*) echo "NL" ;;
+    *united\ kingdom*|*英国*) echo "GB" ;;
+    *france*|*法国*) echo "FR" ;;
+    *canada*|*加拿大*) echo "CA" ;;
+    *australia*|*澳大利亚*) echo "AU" ;;
+    *china*|*中国*) echo "CN" ;;
+    *japan*|*日本*) echo "JP" ;;
+    ""|*位置未知*) echo "-" ;;
+    *)
+      # Cymru 回退时通常已经是两位国家代码；其它未知文本只保留很短的首段。
+      if [[ "$raw" =~ ^[A-Z]{2}$ ]]; then
+        echo "$raw"
+      else
+        raw=${raw%%,*}
+        raw=${raw%%|*}
+        [ ${#raw} -gt 12 ] && raw="${raw:0:12}"
+        echo "${raw:--}"
+      fi
+      ;;
+  esac
+}
 
-  if command -v nexttrace-tiny >/dev/null 2>&1; then
-    # -M 只关闭路线图，不关闭逐跳表；保留 GeoIP。ip-api.com 无需 token，失败时再用默认 provider。
-    if nexttrace-tiny "$fam_flag" -T -p "$port" --psize 44 -q 3 -m 30 -M -d ip-api.com -g cn "$target_ip"; then
-      echo
-      return 0
-    fi
-    echo -e "${YELLOW}[!] ip-api.com GeoIP 输出失败，尝试 NextTrace 默认地理位置源...${NC}"
-    if nexttrace-tiny "$fam_flag" -T -p "$port" --psize 44 -q 3 -m 30 -M -g cn "$target_ip"; then
-      echo
-      return 0
-    fi
-    echo -e "${YELLOW}[!] NextTrace 执行失败，回退系统 traceroute。${NC}"
+compact_route_owner() {
+  local raw="$1" asn="$2" lower short
+  lower=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
+  case "$lower" in
+    *china\ mobile*|*cmcc*|*cmi*|*chinamobile*|*10086.cn*) echo "移动" ;;
+    *china\ telecom*|*chinanet*|*ctgnet*|*chinatelecom*) echo "电信" ;;
+    *china\ unicom*|*chinaunicom*|*china169*|*cnc\ group*|*cuii*) echo "联通" ;;
+    *softbank*|*bbtec*) echo "软银" ;;
+    *xtom*) echo "xTom" ;;
+    *owl*) echo "OWL" ;;
+    *ntt*) echo "NTT" ;;
+    *hurricane\ electric*) echo "HE" ;;
+    *cogent*) echo "Cogent" ;;
+    *pccw*) echo "PCCW" ;;
+    *telia*) echo "Telia" ;;
+    *lumen*|*level\ 3*) echo "Lumen" ;;
+    ""|-) echo "-" ;;
+    *)
+      short="$raw"
+      # 去掉常见的冗余公司后缀，再做保守截断，避免终端换行。
+      short=$(printf '%s' "$short" | sed -E 's/[[:space:]]+(Corporation|Corp\.?|Limited|Ltd\.?|Company|Co\.?)([[:space:]].*)?$//I')
+      [ ${#short} -gt 14 ] && short="${short:0:14}"
+      echo "${short:--}"
+      ;;
+  esac
+}
+
+format_route_rtt() {
+  local line="$1" value out="" count=0
+  local -a values=()
+  while IFS= read -r value; do
+    [ -n "$value" ] || continue
+    values+=("$value")
+    [ "${#values[@]}" -ge 3 ] && break
+  done < <(printf '%s\n' "$line" | grep -Eo '[0-9]+([.][0-9]+)?[[:space:]]*ms' | awk '{print $1}' || true)
+
+  if [ "${#values[@]}" -eq 0 ]; then
+    printf '%b*%b' "$DIM" "$NC"
+    return 0
   fi
 
+  for value in "${values[@]}"; do
+    [ -n "$out" ] && out+="  "
+    out+="${BRIGHT_GREEN}${value} ms${NC}"
+    count=$((count + 1))
+  done
+  while [ "$count" -lt 3 ]; do
+    out+="  ${DIM}*${NC}"
+    count=$((count + 1))
+  done
+  printf '%b' "$out"
+}
+
+# 菜单 3 参考 autoBestTrace / BestTrace 的固定三城三网目标。
+# 使用固定目标而不是 getNodes 动态节点，便于不同时间、不同 VPS 之间横向比较。
+BESTTRACE_ROUTE_TARGETS_V4=(
+  "北京|电信|219.141.140.10"
+  "北京|联通|202.106.195.68"
+  "北京|移动|221.179.155.161"
+  "上海|电信|202.96.209.133"
+  "上海|联通|210.22.97.1"
+  "上海|移动|211.136.112.200"
+  "广东|电信|58.60.188.222"
+  "广东|联通|210.21.196.6"
+  "广东|移动|120.196.165.24"
+)
+
+nexttrace_binary() {
+  command -v nexttrace-tiny 2>/dev/null || command -v nexttrace 2>/dev/null || true
+}
+
+nexttrace_supports_raw() {
+  local bin="$1"
+  [ -n "$bin" ] || return 1
+  "$bin" -h 2>&1 | grep -q -- '--raw'
+}
+
+run_icmp_traceroute_fallback_probe() {
+  local target_ip="$1" trace_file="$2"
   check_traceroute
-  if [ "$family" = "6" ]; then
-    traceroute -6 -T -p "$port" -q 3 -w 2 -m 30 "$target_ip" 44 || true
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 75 traceroute -4 -n -I -q 3 -w 2 -m 30 "$target_ip" 28 > "$trace_file" 2>&1 || true
   else
-    traceroute -4 -T -p "$port" -q 3 -w 2 -m 30 "$target_ip" 44 || true
+    traceroute -4 -n -I -q 3 -w 2 -m 30 "$target_ip" 28 > "$trace_file" 2>&1 || true
   fi
-  echo -e "${DIM}  [i] traceroute 备用模式可显示每跳 IP/主机名和 RTT；精确 ASN/城市需 nexttrace-tiny GeoIP。${NC}"
-  echo
+}
+
+# 与用户提供的 autoBestTrace 输出保持同一探测思路：
+# IPv4 / ICMP / 3 probes / 30 hops / 28-byte packet / LeoMoeAPI / 中文。
+run_besttrace_probe_one() {
+  local target_ip="$1" trace_file="$2" bin rc=0
+  bin=$(nexttrace_binary)
+  if [ -n "$bin" ] && nexttrace_supports_raw "$bin"; then
+    if command -v timeout >/dev/null 2>&1; then
+      timeout 90 "$bin" -4 -d LeoMoeAPI -g cn -q 3 -m 30 --psize 28 -M --raw "$target_ip" > "$trace_file" 2>&1 || rc=$?
+    else
+      "$bin" -4 -d LeoMoeAPI -g cn -q 3 -m 30 --psize 28 -M --raw "$target_ip" > "$trace_file" 2>&1 || rc=$?
+    fi
+    if grep -Eq '^[[:space:]]*[0-9]+\|' "$trace_file"; then
+      return 0
+    fi
+  fi
+
+  # 极少数环境的 nexttrace-tiny 不支持 raw；回退系统 ICMP traceroute。
+  # 这时仍保留 IP/RTT，但不会伪造城市信息。
+  : > "$trace_file"
+  if command -v traceroute >/dev/null 2>&1; then
+    run_icmp_traceroute_fallback_probe "$target_ip" "$trace_file"
+    return 2
+  fi
+  return 1
+}
+
+compact_nexttrace_location() {
+  local country="$1" region="$2" city="$3" district="$4" raw
+  raw="$country $region $city $district"
+  compact_route_location "$raw"
+}
+
+format_raw_rtt_slots() {
+  local raw="$1" value out="" count=0
+  IFS=',' read -r -a vals <<< "$raw"
+  for value in "${vals[@]}"; do
+    [ -n "$value" ] || continue
+    [ "$count" -lt 3 ] || break
+    [ -n "$out" ] && out+="  "
+    out+="${BRIGHT_GREEN}${value} ms${NC}"
+    count=$((count + 1))
+  done
+  while [ "$count" -lt 3 ]; do
+    [ -n "$out" ] && out+="  "
+    out+="${DIM}*${NC}"
+    count=$((count + 1))
+  done
+  printf '%b' "$out"
+}
+
+render_nexttrace_raw_compact() {
+  local trace_file="$1" target_ip="$2" target_city="$3" target_isp="$4"
+  local line ttl ip ptr rtt asn country region city district owner lat lng
+  local max_ttl=0 i loc short_loc short_owner asn_text rtt_text key
+  local -A hop_seen=() hop_ip=() hop_asn=() hop_country=() hop_region=() hop_city=() hop_district=() hop_owner=() hop_rtts=() hop_rtt_count=()
+
+  while IFS= read -r line; do
+    line=${line//$'\r'/}
+    [[ "$line" =~ ^[[:space:]]*([0-9]+)\| ]] || continue
+    IFS='|' read -r ttl ip ptr rtt asn country region city district owner lat lng <<< "$line"
+    ttl=$(printf '%s' "$ttl" | tr -d '[:space:]')
+    [[ "$ttl" =~ ^[0-9]+$ ]] || continue
+    hop_seen[$ttl]=1
+    [ "$ttl" -gt "$max_ttl" ] && max_ttl="$ttl"
+    [ "$ip" = "*" ] && continue
+    [ -n "$ip" ] || continue
+
+    # 多路径时显示第一个可响应 IP；三个探测 RTT 仍汇总到固定三个槽位，避免把额外 IP 塞入 RTT 列。
+    if [ -z "${hop_ip[$ttl]:-}" ]; then
+      hop_ip[$ttl]="$ip"
+      hop_asn[$ttl]="$asn"
+      hop_country[$ttl]="$country"
+      hop_region[$ttl]="$region"
+      hop_city[$ttl]="$city"
+      hop_district[$ttl]="$district"
+      hop_owner[$ttl]="$owner"
+    fi
+    if [[ "$rtt" =~ ^[0-9]+([.][0-9]+)?$ ]] && [ "${hop_rtt_count[$ttl]:-0}" -lt 3 ]; then
+      if [ -n "${hop_rtts[$ttl]:-}" ]; then
+        hop_rtts[$ttl]+=",$rtt"
+      else
+        hop_rtts[$ttl]="$rtt"
+      fi
+      hop_rtt_count[$ttl]=$(( ${hop_rtt_count[$ttl]:-0} + 1 ))
+    fi
+  done < "$trace_file"
+
+  if [ "$max_ttl" -eq 0 ]; then
+    return 1
+  fi
+
+  for ((i=1; i<=max_ttl; i++)); do
+    if [ -z "${hop_ip[$i]:-}" ]; then
+      printf '  %-3s %-15s %-9s %-10s %-8s %b*%b\n' "$i" '*' '-' '-' '-' "$DIM" "$NC"
+      continue
+    fi
+    ip=${hop_ip[$i]}
+    asn=${hop_asn[$i]:-}
+    if [[ "$asn" =~ ^[0-9]+$ ]]; then asn_text="AS${asn}"; elif [[ "$asn" =~ ^AS[0-9]+$ ]]; then asn_text="$asn"; else asn_text="-"; fi
+    short_loc=$(compact_nexttrace_location "${hop_country[$i]:-}" "${hop_region[$i]:-}" "${hop_city[$i]:-}" "${hop_district[$i]:-}")
+    short_owner=$(compact_route_owner "${hop_owner[$i]:-}" "$asn_text")
+
+    # 最后一跳仍以固定测试目标定义为准，防止任何 Geo 库偶发把终点城市误标。
+    if [ "$ip" = "$target_ip" ]; then
+      short_loc="CN $target_city"
+      short_owner="$target_isp"
+    fi
+    rtt_text=$(format_raw_rtt_slots "${hop_rtts[$i]:-}")
+    printf '  %-3s %-15s %-9s %-10s %-8s %b\n' "$i" "$ip" "$asn_text" "$short_loc" "$short_owner" "$rtt_text"
+  done
+}
+
+render_icmp_traceroute_fallback() {
+  local trace_file="$1" target_ip="$2" target_city="$3" target_isp="$4"
+  local line ttl ip rtt
+  while IFS= read -r line; do
+    case "$line" in traceroute\ to*|traceroute\:*|"") continue ;; esac
+    ttl=$(printf '%s\n' "$line" | awk '{print $1}')
+    [[ "$ttl" =~ ^[0-9]+$ ]] || continue
+    ip=$(printf '%s\n' "$line" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n 1 || true)
+    if [ -z "$ip" ]; then
+      printf '  %-3s %-15s %-9s %-10s %-8s %b*%b\n' "$ttl" '*' '-' '-' '-' "$DIM" "$NC"
+      continue
+    fi
+    rtt=$(format_route_rtt "$line")
+    if [ "$ip" = "$target_ip" ]; then
+      printf '  %-3s %-15s %-9s %-10s %-8s %b\n' "$ttl" "$ip" '-' "CN $target_city" "$target_isp" "$rtt"
+    else
+      printf '  %-3s %-15s %-9s %-10s %-8s %b\n' "$ttl" "$ip" '-' '-' '-' "$rtt"
+    fi
+  done < "$trace_file"
 }
 
 run_detailed_route_mode() {
-  local family="$1" prov isp host fixed_ip port backup_host backup_ip backup_port count=0
-  check_curl
-  if [ "$family" = "4" ]; then
-    [ "${#REMOTE_CDN4_NODES[@]}" -gt 0 ] || require_remote_nodes "v4"
-  else
-    [ "${#REMOTE_CDN6_NODES[@]}" -gt 0 ] || require_remote_nodes "v6"
-  fi
-  if [ "$family" = "4" ]; then
-    ipv4_available || { echo -e "${YELLOW}[!] 未检测到 IPv4，跳过上海三网 IPv4 逐跳回程${NC}"; return 0; }
-  else
-    ipv6_available || { echo -e "${YELLOW}[!] 未检测到 IPv6，跳过上海三网 IPv6 逐跳回程${NC}"; return 0; }
-  fi
+  local family="$1" entry prov isp target_ip city trace_dir trace_file total=0 idx=0 rc
+  local -a selected_targets=()
 
-  echo -e "${BOLD}${CYAN}  IPv${family} 上海三网逐跳回程路由${NC}"
-  echo -e "${DIM}  范围固定: 上海；目标: 电信 / 联通 / 移动各 1 个节点${NC}"
-  echo
-  while IFS='|' read -r prov isp host fixed_ip port backup_host backup_ip backup_port; do
-    [ "$prov" = "$DOMESTIC_PROVINCE" ] || continue
-    [ -n "$fixed_ip" ] || continue
-    case "$isp" in 电信|联通|移动) ;; *) continue ;; esac
-    count=$((count + 1))
-    run_route_hops_one "$family" "$isp" "$host" "$fixed_ip" "${port:-80}"
-  done < <(print_cdn_entries "$family")
-  if [ "$count" -eq 0 ]; then
-    echo -e "${RED}[X] 未取得上海三网 IPv${family} 节点${NC}"
-    return 1
+  if [ "$family" != "4" ]; then
+    echo -e "${YELLOW}[!] BestTrace 参考模式当前只提供 IPv4 固定目标，跳过 IPv${family}${NC}"
+    return 0
   fi
+  ipv4_available || { echo -e "${YELLOW}[!] 未检测到 IPv4，跳过三城市三网 IPv4 逐跳回程${NC}"; return 0; }
+
+  for entry in "${BESTTRACE_ROUTE_TARGETS_V4[@]}"; do
+    IFS='|' read -r prov isp target_ip <<< "$entry"
+    province_selected "$prov" || continue
+    selected_targets+=("$entry")
+  done
+  total=${#selected_targets[@]}
+  [ "$total" -gt 0 ] || { echo -e "${RED}[X] 没有可执行的三城市三网固定回程目标${NC}"; return 1; }
+
+  echo -e "${BOLD}${CYAN}  IPv4 三网逐跳回程路由${NC}"
+  echo -e "${DIM}  范围: 北京 / 上海 / 广州；电信/联通/移动各 3 个固定目标，共 9 条${NC}"
+  echo -e "${DIM}  参考 autoBestTrace：NextTrace + LeoMoeAPI + ICMP，3 次探测/跳，30 hops，28-byte packet${NC}"
+  echo -e "${DIM}  固定目标用于长期横向比较；菜单 3 不再使用 getNodes 动态回程节点。${NC}"
+  echo
+
+  trace_dir=$(mktemp -d)
+  for entry in "${selected_targets[@]}"; do
+    IFS='|' read -r prov isp target_ip <<< "$entry"
+    city=$(city_display_name "$prov")
+    idx=$((idx + 1))
+    trace_file=$(printf '%s/trace_%02d.txt' "$trace_dir" "$idx")
+    echo -e "${BOLD}${CYAN}  ${city}${isp} IPv4${NC}  ${DIM}-> ${target_ip}${NC}"
+    printf '  %-3s %-15s %-9s %-10s %-8s %s\n' '跳' 'IP' 'ASN' '位置' '运营商' 'RTT'
+
+    rc=0
+    run_besttrace_probe_one "$target_ip" "$trace_file" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+      if ! render_nexttrace_raw_compact "$trace_file" "$target_ip" "$city" "$isp"; then
+        echo -e "${YELLOW}  [!] NextTrace 未返回可解析逐跳结果，改用 ICMP traceroute 回退显示。${NC}"
+        run_icmp_traceroute_fallback_probe "$target_ip" "$trace_file"
+        render_icmp_traceroute_fallback "$trace_file" "$target_ip" "$city" "$isp"
+      fi
+    elif [ "$rc" -eq 2 ]; then
+      echo -e "${YELLOW}  [!] 当前 nexttrace 不支持 raw，已回退系统 ICMP traceroute；位置/ASN 信息会减少。${NC}"
+      render_icmp_traceroute_fallback "$trace_file" "$target_ip" "$city" "$isp"
+    else
+      echo -e "${RED}  [X] 无可用 ICMP 路由工具${NC}"
+    fi
+    echo
+  done
+  rm -rf "$trace_dir"
 }
 
 collect_route_labels() {
@@ -4018,12 +4049,9 @@ run_international_mode() {
   append_international_latency_csv "$csv"
   clear
   print_header
-  echo -e "  ${DIM}报告时间：${report_time}${NC}"
+  echo -e "  ${DIM}测试时间：${report_time}${NC}"
   echo
   show_international_results
-  if [ "$UPLOAD_REPORT" -eq 1 ]; then
-    upload_report "$csv" "${report_time%%（*}"
-  fi
   echo
 }
 
@@ -4039,7 +4067,7 @@ SPEEDTEST_APPLECDN_UPLOAD_URL="${SPEEDTEST_APPLECDN_UPLOAD_URL:-https://mensura.
 SPEEDTEST_APPLECDN_HOST="${SPEEDTEST_APPLECDN_HOST:-mensura.cdn-apple.com}"
 SPEEDTEST_APPLECDN_MAX_MB="${SPEEDTEST_APPLECDN_MAX_MB:-2048}"
 SPEEDTEST_APPLECDN_USER_AGENT="${SPEEDTEST_APPLECDN_USER_AGENT:-networkQuality/194.80.3 CFNetwork/3860.400.51 Darwin/25.3.0}"
-# 不再内置北京测速 fallback；上海远端节点不可用时直接失败，避免误测外省。
+# 单线程测速固定北京 / 上海 / 广州三地节点，不使用三地之外的 fallback。
 SPEEDTEST_TOS_CT_IP="${TOS_CT_IP:-}"
 SPEEDTEST_TOS_CU_IP="${TOS_CU_IP:-}"
 SPEEDTEST_TOS_CM_IP="${TOS_CM_IP:-}"
@@ -4049,12 +4077,12 @@ SPEEDTEST_IPV6_AVAILABLE=0
 SPEEDTEST_TOS_REMOTE_LOADED=0
 SPEEDTEST_APPLECDN6_REMOTE_LOADED=0
 SPEEDTEST_APPLECDN6_NODES=()
-SPEEDTEST_TOS_CT_CITY="上海"
-SPEEDTEST_TOS_CU_CITY="上海"
-SPEEDTEST_TOS_CM_CITY="上海"
-SPEEDTEST_TOS_CT_CANDIDATES="${TOS_CT_IP:+${TOS_CT_IP}|上海|cn-shanghai}"
-SPEEDTEST_TOS_CU_CANDIDATES="${TOS_CU_IP:+${TOS_CU_IP}|上海|cn-shanghai}"
-SPEEDTEST_TOS_CM_CANDIDATES="${TOS_CM_IP:+${TOS_CM_IP}|上海|cn-shanghai}"
+SPEEDTEST_TOS_CT_CITY=""
+SPEEDTEST_TOS_CU_CITY=""
+SPEEDTEST_TOS_CM_CITY=""
+SPEEDTEST_TOS_CT_CANDIDATES=""
+SPEEDTEST_TOS_CU_CANDIDATES=""
+SPEEDTEST_TOS_CM_CANDIDATES=""
 SPEEDTEST_TELECOM_ID=""
 SPEEDTEST_TELECOM_CITY=""
 SPEEDTEST_UNICOM_ID=""
@@ -4082,8 +4110,10 @@ speedtest_candidates() {
 }
 
 speedtest_group_specs() {
-  # 单线程测速同样固定上海三网。
-  printf '%s\n' "上海|cn-shanghai|unlimited"
+  printf '%s\n' \
+    "北京|cn-beijing|unlimited" \
+    "上海|cn-shanghai|unlimited" \
+    "广州|cn-guangzhou|unlimited"
 }
 
 speedtest_group_count() {
@@ -4114,49 +4144,11 @@ speedtest_applecdn6_count() {
   printf '%s' "${#SPEEDTEST_APPLECDN6_NODES[@]}"
 }
 
-request_rank_session() {
-  local response_file session_id token started_at expires_at session_ip4
-  RANK_SESSION_ID=""
-  RANK_SESSION_TOKEN=""
-  RANK_SESSION_STARTED_AT=""
-  RANK_SESSION_EXPIRES_AT=""
-  RANK_SESSION_IP4=""
-  command -v curl &>/dev/null || return 1
-
-  response_file=$(mktemp)
-  if ! curl -4 -fsS --connect-timeout 5 --max-time 15 \
-    -H "X-TcpQuality-Public-IPv4: ${IPV4_PUBLIC:-}" \
-    -H "X-TcpQuality-Public-IPv6: ${IPV6_PUBLIC:-}" \
-    -o "$response_file" "$RANK_SESSION_API" >/dev/null 2>&1; then
-    if [ "$DEBUG_MODE" -eq 1 ]; then
-      cp "$response_file" "$RESULT_DIR/rank_session_response.json" 2>/dev/null || true
-    fi
-    rm -f "$response_file"
-    return 1
-  fi
-  if [ "$DEBUG_MODE" -eq 1 ]; then
-    cp "$response_file" "$RESULT_DIR/rank_session_response.json" 2>/dev/null || true
-  fi
-
-  session_id=$(sed -nE 's/.*"sessionId":"([^"]+)".*/\1/p' "$response_file" | head -1)
-  token=$(sed -nE 's/.*"token":"([^"]+)".*/\1/p' "$response_file" | head -1)
-  started_at=$(sed -nE 's/.*"startedAt":"([^"]+)".*/\1/p' "$response_file" | head -1)
-  expires_at=$(sed -nE 's/.*"expiresAt":"([^"]+)".*/\1/p' "$response_file" | head -1)
-  session_ip4=$(sed -nE 's/.*"sessionIp4":"([^"]+)".*/\1/p' "$response_file" | head -1)
-  rm -f "$response_file"
-  [ -n "$session_id" ] && [ -n "$token" ] || return 1
-  RANK_SESSION_ID="$session_id"
-  RANK_SESSION_TOKEN="$token"
-  RANK_SESSION_STARTED_AT="$started_at"
-  RANK_SESSION_EXPIRES_AT="$expires_at"
-  RANK_SESSION_IP4="$session_ip4"
-  return 0
-}
 
 speedtest_region_title() {
   case "$1" in
     cn-shanghai) printf '上海' ;;
-    cn-guangzhou) printf '广东' ;;
+    cn-guangzhou) printf '广州' ;;
     *) printf '北京' ;;
   esac
 }
@@ -4194,8 +4186,12 @@ load_remote_speedtest_nodes() {
       tos|tosutil|speedtest) ;;
       *) continue ;;
     esac
-    [ "$prov" = "$DOMESTIC_PROVINCE" ] || continue
-    region="cn-beijing"
+    province_selected "$prov" || continue
+    case "$prov" in
+      上海) region="cn-shanghai" ;;
+      广东) region="cn-guangzhou" ;;
+      *) region="cn-beijing" ;;
+    esac
     case "$target" in
       *cn-shanghai*) region="cn-shanghai" ;;
       *cn-guangzhou*) region="cn-guangzhou" ;;
@@ -4204,20 +4200,20 @@ load_remote_speedtest_nodes() {
     case "$isp" in
       电信|CT|ChinaTelecom|chinatelecom)
         SPEEDTEST_TOS_CT_IP="$ip"
-        SPEEDTEST_TOS_CT_CITY="${prov:-北京}"
-        ct_candidates+="${ct_candidates:+$'\n'}$ip|${prov:-北京}|$region"
+        SPEEDTEST_TOS_CT_CITY="$(city_display_name "${prov:-北京}")"
+        ct_candidates+="${ct_candidates:+$'\n'}$ip|$(city_display_name "${prov:-北京}")|$region"
         loaded_ct=1
         ;;
       联通|CU|ChinaUnicom|chinaunicom)
         SPEEDTEST_TOS_CU_IP="$ip"
-        SPEEDTEST_TOS_CU_CITY="${prov:-北京}"
-        cu_candidates+="${cu_candidates:+$'\n'}$ip|${prov:-北京}|$region"
+        SPEEDTEST_TOS_CU_CITY="$(city_display_name "${prov:-北京}")"
+        cu_candidates+="${cu_candidates:+$'\n'}$ip|$(city_display_name "${prov:-北京}")|$region"
         loaded_cu=1
         ;;
       移动|CM|ChinaMobile|chinamobile)
         SPEEDTEST_TOS_CM_IP="$ip"
-        SPEEDTEST_TOS_CM_CITY="${prov:-北京}"
-        cm_candidates+="${cm_candidates:+$'\n'}$ip|${prov:-北京}|$region"
+        SPEEDTEST_TOS_CM_CITY="$(city_display_name "${prov:-北京}")"
+        cm_candidates+="${cm_candidates:+$'\n'}$ip|$(city_display_name "${prov:-北京}")|$region"
         loaded_cm=1
         ;;
     esac
@@ -5345,7 +5341,6 @@ collect_speedtest_results() {
     exit 1
   }
   load_remote_speedtest_nodes || true
-  ensure_public_ips_for_rank
   install_speedtest_counter_dependency || true
   if ! command -v iptables &>/dev/null; then
     SPEEDTEST_RANK_ELIGIBLE=0
@@ -5360,12 +5355,8 @@ collect_speedtest_results() {
     echo -e "${DIM}[debug] 固定 IP: 电信 $SPEEDTEST_TOS_CT_IP / 联通 $SPEEDTEST_TOS_CU_IP / 移动 $SPEEDTEST_TOS_CM_IP${NC}" >&2
     echo -e "${DIM}[debug] 传输方式: curl --resolve（保留 TOS Host/SNI）${NC}" >&2
   fi
-  if request_rank_session; then
-    [ "$DEBUG_MODE" -eq 1 ] && echo -e "${DIM}[debug] rank session 已获取${NC}" >&2
-  else
-    [ -n "$SPEEDTEST_RANK_DISABLED_REASON" ] || SPEEDTEST_RANK_DISABLED_REASON="rank_session_request_failed"
-    [ "$DEBUG_MODE" -eq 1 ] && echo -e "${DIM}[debug] rank session 获取失败：$SPEEDTEST_RANK_DISABLED_REASON，本次报告不会进入排名${NC}" >&2
-  fi
+  SPEEDTEST_RANK_ELIGIBLE=0
+  SPEEDTEST_RANK_DISABLED_REASON="local_only"
   SPEEDTEST_IFACE=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
   [ -n "$SPEEDTEST_IFACE" ] || {
     echo -e "${RED}[X] 无法识别默认网络接口${NC}"
@@ -5770,13 +5761,9 @@ run_speedtest_mode() {
   append_speedtest_csv "$csv"
   clear
   print_header
-  echo -e "  ${DIM}报告时间：${report_time}${NC}"
+  echo -e "  ${DIM}测试时间：${report_time}${NC}"
   echo
   show_speedtest_results
-  if [ "$UPLOAD_REPORT" -eq 1 ]; then
-    echo
-    upload_report "$csv" "${report_time%%（*}"
-  fi
   echo
 }
 
@@ -5801,7 +5788,7 @@ main() {
   if [ "$ROUTE_HOPS_MODE" -eq 1 ]; then
     check_curl
     detect_ip_stack
-    echo -e "  ${DIM}报告时间：$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S CST（北京时间）')${NC}"
+    echo -e "  ${DIM}测试时间：$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S CST（北京时间）')${NC}"
     echo
     if [ "$ONLY_IPV6" -ne 1 ]; then run_detailed_route_mode 4; fi
     if [ "$ONLY_IPV4" -ne 1 ]; then run_detailed_route_mode 6; fi
@@ -5811,7 +5798,7 @@ main() {
   if [ "$ROUTE_MODE" -eq 1 ]; then
     check_curl
     detect_ip_stack
-    echo -e "  ${DIM}报告时间：$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S CST（北京时间）')${NC}"
+    echo -e "  ${DIM}测试时间：$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S CST（北京时间）')${NC}"
     echo ""
     if [ "$ONLY_IPV6" -ne 1 ]; then
       run_route_mode 4
@@ -5849,7 +5836,7 @@ main() {
     echo -e "${DIM}[i] 已按参数跳过 IPv4${NC}"
   fi
 
-  # 精简版不运行教育网或 IPv4 大包；国内部分始终是上海三网。
+  # 精简版不运行教育网或 IPv4 大包；国内部分固定北京 / 上海 / 广州三网。
   test_cdn=1
   normal_cdn_enabled=1
   test_edu=0
@@ -5920,7 +5907,7 @@ main() {
   edu_route_labels_v4=$(mktemp)
   edu_route_labels_v6=$(mktemp)
 
-  # 上海三网回程识别先执行；随后做丢包/延迟和国际互连，避免前置探测影响路由响应。
+  # 三城市三网回程识别先执行；随后做丢包/延迟和国际互连，避免前置探测影响路由响应。
   SPEEDTEST_PROGRESS_TOTAL=0
   if [ "$SPEEDTEST_ENABLED" -eq 1 ]; then
     SPEEDTEST_PROGRESS_TOTAL=$(($(speedtest_group_count) * 3))
@@ -6118,7 +6105,7 @@ main() {
   # ---- TUI 结果展示 ----
   clear
   print_header
-  echo -e "  ${DIM}报告时间：${report_time}${NC}"
+  echo -e "  ${DIM}测试时间：${report_time}${NC}"
   echo ""
 
   if [ "$normal_cdn_enabled" -eq 1 ]; then
@@ -6160,17 +6147,8 @@ main() {
     echo
   fi
 
-  if [ "$UPLOAD_REPORT" -eq 1 ]; then
-    upload_report "$CSV" "${report_time%%（*}"
-  fi
   echo ""
 
-  if [ "$ROUTE_HOPS_AFTER" -eq 1 ]; then
-    echo -e "${BOLD}${CYAN}  上海三网逐跳回程明细${NC}"
-    echo
-    if [ "$ONLY_IPV6" -ne 1 ]; then run_detailed_route_mode 4; fi
-    if [ "$ONLY_IPV4" -ne 1 ]; then run_detailed_route_mode 6; fi
-  fi
 
   rm -f "$sorted_v4" "$sorted_v6" "$sorted_large_v4" "$sorted_cernet" "$sorted_cernet2" "$route_labels_v4" "$route_labels_v6" "$route_labels_large_v4" "$edu_route_labels_v4" "$edu_route_labels_v6"
 }
