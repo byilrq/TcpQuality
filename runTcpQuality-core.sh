@@ -258,7 +258,7 @@ require_raw_socket_privilege() {
 # ===================== 远端节点 =====================
 # 节点域名、真实 IP 与端口统一由 GET_NODES_URL 提供，脚本不再内置探测节点或备用节点。
 
-PACKETS=25
+PACKETS=20
 MAX_PACKETS=600
 COUNT_EXPLICIT=0
 PACKET_SIZES=(40 80 160 320 640 1200)
@@ -275,7 +275,7 @@ LARGE_PACKET_PRECHECK_LOSS=""
 IPV6_NPING_PRECHECK_PACKETS=3
 IPV6_NPING_FORCE_L2=0
 TOTAL=0
-PARALLEL=16
+PARALLEL=6
 PARALLEL_EXPLICIT=0
 TEST_CERNET=0
 TEST_ALL=0
@@ -288,26 +288,27 @@ ONLY_LARGE=0
 ROUTE_MODE=0
 ROUTE_PROTOCOL="tcp"
 ROUTE_ACTIVE_PREFIX=""
+DOMESTIC_ROUTE_ENABLED=1
 DOMESTIC_PROVINCE="上海"
 # 精简版固定只检测上海三网，避免默认全国节点探测带来的额外流量。
 SELECTED_PROVINCES="|${DOMESTIC_PROVINCE}|"
 DEBUG_MODE=0
 SPEEDTEST_ENABLED=0
 SPEEDTEST_ONLY=0
-INTERNATIONAL_ENABLED=0
+INTERNATIONAL_ENABLED=1
 INTERNATIONAL_ONLY=0
 INTL_REQUESTED=0
 INTERNATIONAL_PROGRESS_TOTAL=0
-INTERNATIONAL_PACKETS=15
+INTERNATIONAL_PACKETS=8
 INTERNATIONAL_HTTP_TIMEOUT=8
-INTERNATIONAL_MAX_IPS="${TCPQUALITY_INTERNATIONAL_MAX_IPS:-2}"
+INTERNATIONAL_MAX_IPS="${TCPQUALITY_INTERNATIONAL_MAX_IPS:-1}"
 if ! [[ "$INTERNATIONAL_MAX_IPS" =~ ^[1-9][0-9]*$ ]]; then
-  INTERNATIONAL_MAX_IPS=2
+  INTERNATIONAL_MAX_IPS=1
 fi
-INTERNATIONAL_IPERF_SECONDS="${TCPQUALITY_INTERNATIONAL_IPERF_SECONDS:-5}"
+INTERNATIONAL_IPERF_SECONDS="${TCPQUALITY_INTERNATIONAL_IPERF_SECONDS:-3}"
 INTERNATIONAL_IPERF_RATE="${TCPQUALITY_INTERNATIONAL_IPERF_RATE:-1M}"
 INTERNATIONAL_IPERF_CONNECT_TIMEOUT_MS="${TCPQUALITY_INTERNATIONAL_IPERF_CONNECT_TIMEOUT_MS:-5000}"
-INTERNATIONAL_IPERF_MAX_ATTEMPTS=10
+INTERNATIONAL_IPERF_MAX_ATTEMPTS=3
 SPEEDTEST_STATE_FILE=""
 SPEEDTEST_PROGRESS_FILE=""
 SPEEDTEST_BACKGROUND=0
@@ -514,11 +515,8 @@ count_cernet2_nodes() {
 }
 
 node_scope() {
-  if [ "$TEST_ALL" -eq 1 ] || { [ "$INCLUDE_DEFAULT_ROUTE" -eq 1 ] && [ "$TEST_CERNET" -eq 1 ]; }; then
-    echo "all"
-  elif [ "$TEST_CERNET" -eq 1 ]; then
-    echo "cernet"
-  elif [ "$ONLY_IPV4" -eq 1 ] && [ "$ONLY_IPV6" -eq 0 ]; then
+  # 上海精简版只向节点服务请求三网 CDN；不请求教育网/全国节点。
+  if [ "$ONLY_IPV4" -eq 1 ] && [ "$ONLY_IPV6" -eq 0 ]; then
     echo "v4"
   elif [ "$ONLY_IPV6" -eq 1 ] && [ "$ONLY_IPV4" -eq 0 ]; then
     echo "v6"
@@ -552,26 +550,33 @@ load_remote_nodes() {
   REMOTE_CDN6_NODES=()
   REMOTE_CERNET_NODES=()
   REMOTE_CERNET2_NODES=()
+  local seen_4_ct=0 seen_4_cu=0 seen_4_cm=0 seen_6_ct=0 seen_6_cu=0 seen_6_cm=0
 
   while IFS= read -r line; do
     line=${line//$'\t'/'|'}
     IFS='|' read -r type family prov isp host ip port target backup_host backup_ip backup_port backup_target <<< "$line"
     [ "$type" = "type" ] && continue
     [ -n "$ip" ] || continue
-    # 国内三网节点只保留上海电信/联通/移动，其他省份和其它运营商直接丢弃。
-    if [ "$type" = "cdn" ]; then
-      [ "$prov" = "$DOMESTIC_PROVINCE" ] || continue
-      case "$isp" in
-        电信|联通|移动) ;;
-        *) continue ;;
-      esac
-    fi
+    # 国内部分严格限定：上海 + 电信/联通/移动 + 每协议每运营商只取 1 个节点。
+    [ "$type" = "cdn" ] || continue
+    [ "$prov" = "$DOMESTIC_PROVINCE" ] || continue
+    case "$isp" in
+      电信|联通|移动) ;;
+      *) continue ;;
+    esac
     port=${port:-80}
-    case "$type:$family" in
-      cdn:4) REMOTE_CDN4_NODES+=("$prov|$isp|$host|$ip|$port|$backup_host|$backup_ip|${backup_port:-80}") ;;
-      cdn:6) REMOTE_CDN6_NODES+=("$prov|$isp|$host|$ip|$port|$backup_host|$backup_ip|${backup_port:-80}") ;;
-      cernet:4) REMOTE_CERNET_NODES+=("$prov|$host|$ip|$port|$backup_host|$backup_ip|${backup_port:-443}") ;;
-      cernet2:6) REMOTE_CERNET2_NODES+=("$prov|$host|$ip|$port|$backup_host|$backup_ip|${backup_port:-443}") ;;
+    case "$family:$isp" in
+      4:电信) [ "$seen_4_ct" -eq 0 ] || continue; seen_4_ct=1 ;;
+      4:联通) [ "$seen_4_cu" -eq 0 ] || continue; seen_4_cu=1 ;;
+      4:移动) [ "$seen_4_cm" -eq 0 ] || continue; seen_4_cm=1 ;;
+      6:电信) [ "$seen_6_ct" -eq 0 ] || continue; seen_6_ct=1 ;;
+      6:联通) [ "$seen_6_cu" -eq 0 ] || continue; seen_6_cu=1 ;;
+      6:移动) [ "$seen_6_cm" -eq 0 ] || continue; seen_6_cm=1 ;;
+      *) continue ;;
+    esac
+    case "$family" in
+      4) REMOTE_CDN4_NODES+=("$prov|$isp|$host|$ip|$port|$backup_host|$backup_ip|${backup_port:-80}") ;;
+      6) REMOTE_CDN6_NODES+=("$prov|$isp|$host|$ip|$port|$backup_host|$backup_ip|${backup_port:-80}") ;;
     esac
   done < "$tmp"
   rm -f "$tmp"
@@ -619,70 +624,46 @@ print_cernet2_entries() {
 # ===================== 参数与帮助 =====================
 show_help() {
   cat <<EOF
-TcpQuality 节点 TCP 丢包探测脚本
+TcpQuality 上海三网精简版（保留国际互连 + 回程线路）
 
 用法:
-  bash <(curl -sL https://raw.githubusercontent.com/ibsgss/TcpQuality/main/runTcpQuality.sh) [选项]
+  bash runTcpQuality.sh [选项]
 
-NixOS:
-  脚本会自动通过 nix shell 提供运行依赖，不会写入 environment.systemPackages。
-  使用 --speedtest/--only-speedtest 时会通过 curl --resolve 固定 TOS IP 做单线程测速。
+默认执行：
+  1. 上海电信 / 联通 / 移动各 1 个节点的 TCP SYN 丢包与延迟
+  2. 同一批上海三网节点的 TCP traceroute 回程线路识别
+  3. 国际网站 / CDN TCP 互连与国际 iPerf3 双向测试
+  IPv4/IPv6 可用时分别测试；不会请求全国节点、教育网或 IPv4 大包测试。
 
 选项:
   -h, --help        显示帮助信息并退出
-  -c, --count NUM   设置每节点发包数，范围 1-${MAX_PACKETS}，默认 ${PACKETS}
+  -c, --count NUM   每个上海三网节点发包数，范围 1-${MAX_PACKETS}，默认 ${PACKETS}
   -s, --size NUM    指定 IP 包总长度（单位 B），0 为标准无负载 SYN；默认 0
-                     小于协议头部的数值按最小头部长度发送
   -p, --parallel NUM
-                     设置并行节点数，范围 1-31，默认按内存自动选择
-  -v4, --v4         仅探测 IPv4
-  -v6, --v6         仅探测 IPv6
-  --only-large      仅探测 IPv4大包回程
-  --cernet          仅探测 CERNET IPv4 和 CERNET2 IPv6
-  --all             探测 IPv4/IPv6、CERNET/CERNET2、国际互联和单线程测速
-  --route           仅做三网回程线路识别，不执行 nping 丢包探测、不上传报告
+                     并行数，范围 1-31；精简版自动并行上限为 6
+  -v4, --v4         国内三网仅测试 IPv4（国际互连仍使用可用 IPv4）
+  -v6, --v6         国内三网仅测试 IPv6；无 IPv4 时自动跳过国际互连
+  --only-domestic  仅测上海三网 TCP 质量/延迟 + 回程路由
+  --only-domestic-latency
+                     仅测上海三网 TCP 丢包与延迟，不跑 traceroute
+  --only-intl       仅测国际网站/CDN 与国际 iPerf3 互联
+  --route           仅做上海三网回程线路识别，不执行丢包/延迟和国际互连
   --route-protocol PROTO
-                    设置 --route 的 traceroute 协议: tcp、udp、both，默认 tcp
-  --speedtest       追加单线程测速（固定上海三网）
-  --only-speedtest  仅运行单线程测速（固定上海三网）
-  --intl            单独使用时仅运行国际互联；与 -v4/-v6/--all 等组合时追加国际互联
+                     traceroute 协议: tcp、udp、both，默认 tcp
+  --speedtest       在默认测试后追加上海三网单线程测速
+  --only-speedtest  仅运行上海三网单线程测速
+  --intl            兼容参数；国际互连已默认启用
   --no-rank-upload  不上传报告，也不参与速度排名
-  --province CODE   上海精简版仅接受 sh/上海；-sh 也可使用
-                     其它省份参数已禁用，避免重新加入外省节点
-  --debug           保留临时文件并输出调试信息，便于排查线路识别问题
+  --debug           保留临时文件并输出调试信息
 
-国际互联：
-  CDN 目标优先使用静态资源入口；每个域名最多探测 2 个公网 IPv4，结果合并统计。
-  国际节点分别执行 iPerf3 上传和下载（-R）；每个方向显示 TCP RTT 与重传次数，每行最多三个节点。
-  国际节点 iPerf3 默认限速 1M、测试 5 秒；每个节点/协议/方向最多尝试 10 次，成功即停止；可用 TCPQUALITY_INTERNATIONAL_IPERF_RATE/TCPQUALITY_INTERNATIONAL_IPERF_SECONDS 覆盖。
-  设置 TCPQUALITY_INTERNATIONAL_MAX_IPS=1 可恢复每个域名只探测一个地址。
-  --debug 还会保存国际互联目标的候选 IP、HTTP 状态、边缘和缓存信息。
-
-示例:
-  bash <(curl -sL https://raw.githubusercontent.com/ibsgss/TcpQuality/main/runTcpQuality.sh) -c 100
-  bash <(curl -sL https://raw.githubusercontent.com/ibsgss/TcpQuality/main/runTcpQuality.sh) -bj -v4 --cernet
-  bash <(curl -sL https://raw.githubusercontent.com/ibsgss/TcpQuality/main/runTcpQuality.sh) --route --debug
-  bash <(curl -sL https://raw.githubusercontent.com/ibsgss/TcpQuality/main/runTcpQuality.sh) --speedtest
-
-依赖:
-  - nping: 随 nmap 安装
-  - curl: 用于检测公网 IPv4/IPv6 与上传报告
-  - iperf3/jq/ss: 国际节点 iPerf3 TCP RTT、双向重传与反向 TCP_INFO RTT 解析
-  - traceroute: 用于自动识别三网 TCP 回程线路
-  - nexttrace-tiny: 可选；用于 IPv4大包回程的 TCP 1200B 大包路由识别
-  - curl/iproute2: 单线程测速使用
-  - awk/sed/grep: 用于结果解析和展示
-
-安装提示:
-  - NixOS:          无需安装，脚本自动进入临时 nix shell
-  - Debian/Ubuntu: apt-get install -y curl nmap iperf3 iproute2 jq traceroute
-  - RHEL/Fedora:   dnf install -y curl nmap iperf3 iproute jq traceroute
-  - Alpine Linux:  apk add curl nmap-nping iperf3 iproute2 jq traceroute
-  - Arch Linux:    pacman -S curl nmap iperf3 iproute2 jq traceroute
-  - macOS:         brew install curl nmap iperf3 jq traceroute
+低流量默认：
+  国内 TCP 探测 20 包/节点；国际 TCP 探测 8 包/目标且每域名只取 1 个 IP；
+  国际 iPerf3 默认 1M × 3 秒，失败最多 3 次；可通过原环境变量覆盖。
+  单线程测速默认单方向对象上限 100MB、超时 5 秒，AppleCDN 默认关闭。
 
 说明:
-  发送裸 TCP SYN 包通常需要 root 权限；请切换到 root 用户后运行。
+  三个 Shell 文件职责不同：runTcpQuality.sh=入口，runTcpQuality-core.sh=测速核心，
+  runTcpQuality-rootfs.sh=临时隔离运行环境，并非重复文件。
 EOF
 }
 
@@ -698,101 +679,50 @@ parse_args() {
           echo -e "${RED}[X] 发包数必须是 1-${MAX_PACKETS} 之间的整数${NC}" >&2
           exit 1
         fi
-        PACKETS="$2"
-        COUNT_EXPLICIT=1
-        shift 2
+        PACKETS="$2"; COUNT_EXPLICIT=1; shift 2
         ;;
       -s|--size)
         if [ -z "${2:-}" ] || ! [[ "$2" =~ ^[0-9]+$ ]] || [ "$2" -gt 65535 ]; then
           echo -e "${RED}[X] 包长必须是 0-65535 之间的整数（单位 B）${NC}" >&2
           exit 1
         fi
-        PACKET_SIZE_OVERRIDE="$2"
-        shift 2
+        PACKET_SIZE_OVERRIDE="$2"; shift 2
         ;;
       -p|--parallel)
         if [ -z "${2:-}" ] || ! [[ "$2" =~ ^[0-9]+$ ]] || [ "$2" -lt 1 ] || [ "$2" -gt 31 ]; then
           echo -e "${RED}[X] 并行节点数必须是 1-31 之间的整数${NC}" >&2
           exit 1
         fi
-        PARALLEL="$2"
-        PARALLEL_EXPLICIT=1
-        shift 2
+        PARALLEL="$2"; PARALLEL_EXPLICIT=1; shift 2
         ;;
-      -v4|--v4)
-        ONLY_IPV4=1
-        shift
-        ;;
-      -v6|--v6)
-        ONLY_IPV6=1
-        shift
-        ;;
-      --only-large)
-        ONLY_LARGE=1
-        shift
-        ;;
-      --cernet)
-        TEST_CERNET=1
-        shift
-        ;;
-      --all)
-        TEST_ALL=1
-        SPEEDTEST_ENABLED=1
-        INTERNATIONAL_ENABLED=1
-        shift
-        ;;
-      --route)
-        ROUTE_MODE=1
-        UPLOAD_REPORT=0
-        shift
-        ;;
+      -v4|--v4) ONLY_IPV4=1; shift ;;
+      -v6|--v6) ONLY_IPV6=1; shift ;;
+      --only-domestic) INTERNATIONAL_ENABLED=0; DOMESTIC_ROUTE_ENABLED=1; shift ;;
+      --only-domestic-latency) INTERNATIONAL_ENABLED=0; DOMESTIC_ROUTE_ENABLED=0; shift ;;
+      --only-intl) INTERNATIONAL_ENABLED=1; INTERNATIONAL_ONLY=1; shift ;;
+      --route) ROUTE_MODE=1; UPLOAD_REPORT=0; shift ;;
       --route-protocol)
         if [ -z "${2:-}" ] || { [ "$2" != "tcp" ] && [ "$2" != "udp" ] && [ "$2" != "both" ]; }; then
           echo -e "${RED}[X] --route-protocol 只支持 tcp、udp、both${NC}" >&2
           exit 1
         fi
-        ROUTE_PROTOCOL="$2"
-        shift 2
+        ROUTE_PROTOCOL="$2"; shift 2
         ;;
-      --speedtest)
-        SPEEDTEST_ENABLED=1
-        shift
-        ;;
-      --only-speedtest)
-        SPEEDTEST_ENABLED=1
-        SPEEDTEST_ONLY=1
-        shift
-        ;;
-      --intl)
-        INTL_REQUESTED=1
-        INTERNATIONAL_ENABLED=1
-        [ "$REPORT_UPLOAD_FORCED_OFF" -eq 1 ] || UPLOAD_REPORT=1
-        shift
-        ;;
-      --no-rank-upload)
-        UPLOAD_REPORT=0
-        REPORT_UPLOAD_FORCED_OFF=1
-        shift
-        ;;
-      --debug)
-        DEBUG_MODE=1
-        shift
-        ;;
+      --speedtest) SPEEDTEST_ENABLED=1; shift ;;
+      --only-speedtest) SPEEDTEST_ENABLED=1; SPEEDTEST_ONLY=1; INTERNATIONAL_ENABLED=0; shift ;;
+      --intl) INTERNATIONAL_ENABLED=1; shift ;;
+      --no-rank-upload) UPLOAD_REPORT=0; REPORT_UPLOAD_FORCED_OFF=1; shift ;;
+      --debug) DEBUG_MODE=1; shift ;;
       --province)
-        if [ -z "${2:-}" ] || ! add_province_filter "$2"; then
-          echo -e "${RED}[X] 不支持的省份代码: ${2:-}${NC}" >&2
-          exit 1
+        if [ "${2:-}" != "sh" ] && [ "${2:-}" != "上海" ]; then
+          echo -e "${RED}[X] 精简版固定上海，不支持其它省份${NC}" >&2; exit 1
         fi
         shift 2
         ;;
-      -??|-???)
-        if add_province_filter "$1"; then
-          shift
-        else
-          echo -e "${RED}[X] 不支持的参数: $1${NC}" >&2
-          echo "使用 -h 或 --help 查看帮助。" >&2
-          exit 1
-        fi
+      -sh) shift ;;
+      --cernet|--all|--only-large)
+        echo -e "${RED}[X] 精简版已移除全国/教育网/IPv4大包入口: $1${NC}" >&2
+        exit 1
         ;;
       *)
         echo -e "${RED}[X] 不支持的参数: $1${NC}" >&2
@@ -802,30 +732,9 @@ parse_args() {
     esac
   done
 
-  if [ "$ONLY_LARGE" -eq 1 ]; then
-    ONLY_IPV4=1
-    ONLY_IPV6=0
-    TEST_CERNET=0
-    TEST_ALL=0
-    INCLUDE_DEFAULT_ROUTE=0
-    ROUTE_MODE=0
-    SPEEDTEST_ENABLED=0
-    SPEEDTEST_ONLY=0
-    INTERNATIONAL_ENABLED=0
-    INTERNATIONAL_ONLY=0
-  fi
-
-  if [ "$INTL_REQUESTED" -eq 1 ] \
-    && [ "$ONLY_LARGE" -eq 0 ] \
-    && [ "$ONLY_IPV4" -eq 0 ] \
-    && [ "$ONLY_IPV6" -eq 0 ] \
-    && [ "$TEST_CERNET" -eq 0 ] \
-    && [ "$TEST_ALL" -eq 0 ] \
-    && [ "$INCLUDE_DEFAULT_ROUTE" -eq 0 ] \
-    && [ "$ROUTE_MODE" -eq 0 ] \
-    && [ "$SPEEDTEST_ENABLED" -eq 0 ] \
-    && [ -z "$SELECTED_PROVINCES" ]; then
-    INTERNATIONAL_ONLY=1
+  if [ "$ONLY_IPV4" -eq 1 ] && [ "$ONLY_IPV6" -eq 1 ]; then
+    echo -e "${RED}[X] -v4 与 -v6 不能同时使用${NC}" >&2
+    exit 1
   fi
 }
 
@@ -851,7 +760,7 @@ auto_parallel_by_memory() {
   [[ "$mem_mb" =~ ^[0-9]+$ ]] || mem_mb=512
   parallel=$(((mem_mb + 47) / 48))
   [ "$parallel" -lt 1 ] && parallel=1
-  [ "$parallel" -gt 93 ] && parallel=93
+  [ "$parallel" -gt 6 ] && parallel=6
   echo "$parallel"
 }
 
@@ -1144,7 +1053,7 @@ show_provider_summary() {
     return format_summary_cell(label, latency, loss_text, latency_color(v, l), loss_color(l))
   }
   function route_label(prov, isp) {
-    return ((prov SUBSEP isp) in route) ? route[prov SUBSEP isp] : isp
+    return ((prov SUBSEP isp) in route) ? route[prov SUBSEP isp] : "-"
   }
   FILENAME == ARGV[1] && NF >= 6 {
     if ($1 == "OK") route[$2 SUBSEP $3] = $6
@@ -4048,9 +3957,9 @@ run_international_mode() {
 SPEEDTEST_IFACE=""
 SPEEDTEST_TOS_REGION="${TOS_REGION:-cn-shanghai}"
 SPEEDTEST_TOS_NETWORK="${TOS_NETWORK:-public}"
-SPEEDTEST_TOS_SIZE="${TOS_PROBE_SIZE:-500MB}"
-SPEEDTEST_TOS_TIMEOUT="${TOS_TIMEOUT:-10}"
-SPEEDTEST_APPLECDN_ENABLED="${SPEEDTEST_APPLECDN_ENABLED:-1}"
+SPEEDTEST_TOS_SIZE="${TOS_PROBE_SIZE:-100MB}"
+SPEEDTEST_TOS_TIMEOUT="${TOS_TIMEOUT:-5}"
+SPEEDTEST_APPLECDN_ENABLED="${SPEEDTEST_APPLECDN_ENABLED:-0}"
 SPEEDTEST_APPLECDN_DOWNLOAD_URL="${SPEEDTEST_APPLECDN_DOWNLOAD_URL:-https://mensura.cdn-apple.com/api/v1/gm/large}"
 SPEEDTEST_APPLECDN_UPLOAD_URL="${SPEEDTEST_APPLECDN_UPLOAD_URL:-https://mensura.cdn-apple.com/api/v1/gm/slurp}"
 SPEEDTEST_APPLECDN_HOST="${SPEEDTEST_APPLECDN_HOST:-mensura.cdn-apple.com}"
@@ -5856,18 +5765,10 @@ main() {
     echo -e "${DIM}[i] 已按参数跳过 IPv4${NC}"
   fi
 
-  if [ "$TEST_CERNET" -eq 1 ] && [ "$TEST_ALL" -eq 0 ] && [ "$INCLUDE_DEFAULT_ROUTE" -eq 0 ]; then
-    test_cdn=0
-    normal_cdn_enabled=0
-    test_edu=1
-  elif [ "$TEST_CERNET" -eq 1 ] || [ "$TEST_ALL" -eq 1 ]; then
-    test_edu=1
-  fi
-  if [ "$ONLY_LARGE" -eq 1 ]; then
-    normal_cdn_enabled=0
-    test_edu=0
-    INTERNATIONAL_ENABLED=0
-  fi
+  # 精简版不运行教育网或 IPv4 大包；国内部分始终是上海三网。
+  test_cdn=1
+  normal_cdn_enabled=1
+  test_edu=0
   if [ "$want_ipv4" -eq 0 ] || [ "$ipv4_enabled" -eq 0 ]; then
     INTERNATIONAL_ENABLED=0
   fi
@@ -5880,19 +5781,11 @@ main() {
   cernet_node_count=$(count_cernet_nodes)
   cernet2_node_count=$(count_cernet2_nodes)
 
-  if [ "$ipv4_enabled" -eq 1 ] && [ "$test_cdn" -eq 1 ]; then
-    large_packet_enabled=1
-    large_node_count="$cdn4_node_count"
-    if ! check_nexttrace; then
-      large_packet_enabled=0
-      large_packet_route_enabled=0
-      large_packet_probe_enabled=0
-    else
-      # IPv4 大包的 nexttrace 属于回程识别；大包 nping 预检延后到路由阶段之后。
-      large_packet_route_enabled=1
-      large_packet_probe_enabled=1
-    fi
-  fi
+  # IPv4 大包/nexttrace 已从默认测试面移除，减少时间、流量与依赖。
+  large_packet_enabled=0
+  large_packet_route_enabled=0
+  large_packet_probe_enabled=0
+  large_node_count=0
 
   TOTAL=0
   if [ "$ipv4_enabled" -eq 1 ] && [ "$normal_cdn_enabled" -eq 1 ]; then TOTAL=$((TOTAL + cdn4_node_count)); fi
@@ -5927,7 +5820,7 @@ main() {
     if [ "$ipv4_enabled" -eq 1 ]; then families+=(4); fi
     if [ "$ipv6_enabled" -eq 1 ]; then families+=(6); fi
   fi
-  if [ "$normal_cdn_enabled" -eq 1 ] || [ "$test_edu" -eq 1 ]; then
+  if [ "$DOMESTIC_ROUTE_ENABLED" -eq 1 ] && { [ "$normal_cdn_enabled" -eq 1 ] || [ "$test_edu" -eq 1 ]; }; then
     check_traceroute
   fi
 
@@ -5943,7 +5836,7 @@ main() {
   edu_route_labels_v4=$(mktemp)
   edu_route_labels_v6=$(mktemp)
 
-  # 回程识别先执行；完成后再做延迟/丢包、国际互联和测速，避免前置探测流量影响路由响应。
+  # 上海三网回程识别先执行；随后做丢包/延迟和国际互连，避免前置探测影响路由响应。
   SPEEDTEST_PROGRESS_TOTAL=0
   if [ "$SPEEDTEST_ENABLED" -eq 1 ]; then
     SPEEDTEST_PROGRESS_TOTAL=$(($(speedtest_group_count) * 3))
@@ -5956,8 +5849,10 @@ main() {
   if [ "$INTERNATIONAL_ENABLED" -eq 1 ]; then
     INTERNATIONAL_PROGRESS_TOTAL=$(international_total_task_count)
   fi
-  if [ "$normal_cdn_enabled" -eq 1 ] || [ "$test_edu" -eq 1 ] || [ "$large_packet_route_enabled" -eq 1 ]; then
+  if [ "$DOMESTIC_ROUTE_ENABLED" -eq 1 ] && { [ "$normal_cdn_enabled" -eq 1 ] || [ "$test_edu" -eq 1 ] || [ "$large_packet_route_enabled" -eq 1 ]; }; then
     set_route_progress_total "$ipv4_enabled" "$ipv6_enabled" "$normal_cdn_enabled" "$test_edu" "$large_packet_route_enabled"
+  else
+    ROUTE_PROGRESS_TOTAL=0
   fi
   echo -e "  ${DIM}正在检测，请稍候...${NC}"
   MULTI_PROGRESS_MODE=1
@@ -5966,7 +5861,7 @@ main() {
   show_progress
 
   # 第一阶段：只做回程路由识别。所有 nping 延迟/丢包探测都在此阶段结束后执行。
-  if [ "$normal_cdn_enabled" -eq 1 ] || [ "$test_edu" -eq 1 ] || [ "$large_packet_route_enabled" -eq 1 ]; then
+  if [ "$DOMESTIC_ROUTE_ENABLED" -eq 1 ] && { [ "$normal_cdn_enabled" -eq 1 ] || [ "$test_edu" -eq 1 ] || [ "$large_packet_route_enabled" -eq 1 ]; }; then
     start_route_background "$route_labels_v4" "$route_labels_v6" "$ipv4_enabled" "$ipv6_enabled" "$normal_cdn_enabled" "$test_edu" "$edu_route_labels_v4" "$edu_route_labels_v6" "$route_labels_large_v4" "$large_packet_route_enabled"
     wait_route_background
   fi
@@ -6074,7 +5969,12 @@ main() {
         f="${RESULT_DIR}/cdn${family}_${i}"
         if [ -f "$f" ]; then
           IFS='|' read -r status prov isp host ip snd rcv loss lat < "$f"
-          route_label=$(awk -F'|' -v p="$prov" -v i="$isp" '$2 == p && $3 == i { if ($1 == "OK") print $6; else print "Hidden"; exit }' "$route_file")
+          if [ "$DOMESTIC_ROUTE_ENABLED" -eq 1 ]; then
+            route_label=$(awk -F'|' -v p="$prov" -v i="$isp" '$2 == p && $3 == i { if ($1 == "OK") print $6; else print "Hidden"; exit }' "$route_file")
+            route_label=${route_label:-Hidden}
+          else
+            route_label="-"
+          fi
           if [ "$status" != "OK" ] && [ "$status" != "SKIP" ]; then route_label="failed"; fi
           echo "三网,IPv${family},$prov,$isp,$host,$ip,$status,$snd,$rcv,$loss,$lat,$route_label" >> "$CSV"
           echo "$status|$prov|$isp|$host|$ip|$snd|$rcv|$loss|$lat" >> "$sorted_file"
@@ -6139,13 +6039,21 @@ main() {
 
   if [ "$normal_cdn_enabled" -eq 1 ]; then
     if [ "$ipv4_enabled" -eq 1 ]; then
-      show_family_results "IPv4回程" "$sorted_v4" "$route_labels_v4"
+      if [ "$DOMESTIC_ROUTE_ENABLED" -eq 1 ]; then
+        show_family_results "IPv4 回程 + 延迟" "$sorted_v4" "$route_labels_v4"
+      else
+        show_family_results "IPv4 延迟" "$sorted_v4" "$route_labels_v4"
+      fi
     fi
     if [ "$large_packet_enabled" -eq 1 ]; then
       show_large_packet_results "IPv4大包回程" "$sorted_large_v4" "$route_labels_large_v4" "$LARGE_PACKET_FIREWALL_LIMITED"
     fi
     if [ "$ipv6_enabled" -eq 1 ]; then
-      show_family_results "IPv6回程" "$sorted_v6" "$route_labels_v6"
+      if [ "$DOMESTIC_ROUTE_ENABLED" -eq 1 ]; then
+        show_family_results "IPv6 回程 + 延迟" "$sorted_v6" "$route_labels_v6"
+      else
+        show_family_results "IPv6 延迟" "$sorted_v6" "$route_labels_v6"
+      fi
     fi
   fi
   if [ "$test_edu" -eq 1 ] && [ -s "$sorted_cernet" ] && [ -s "$sorted_cernet2" ]; then

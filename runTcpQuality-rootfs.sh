@@ -12,7 +12,6 @@ ORIGINAL_ARGS=("$@")
 DISTRO="debian"
 ROOTFS_DIR=""
 KEEP_ROOTFS=0
-ALLOW_SPEEDTEST=0
 ROOTFS_URL="${TCPQUALITY_ROOTFS_URL:-}"
 ROOTFS_SHA256="${TCPQUALITY_ROOTFS_SHA256:-}"
 DEBIAN_SUITE="${TCPQUALITY_DEBIAN_SUITE:-bookworm}"
@@ -23,8 +22,6 @@ ROOTFS_GITHUB_REPOSITORY="${TCPQUALITY_ROOTFS_GITHUB_REPOSITORY:-ibsgss/TcpQuali
 ROOTFS_IBSGSS_BASE="${TCPQUALITY_ROOTFS_IBSGSS_BASE:-https://tcpquality.ibsgss.uk/rootfs/releases}"
 OUTPUT_DIR="${TCPQUALITY_OUTPUT_DIR:-/tmp}"
 GUEST_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-NEXTTRACE_RELEASE_API=https://api.github.com/repos/nxtrace/NTrace-core/releases/latest
-NEXTTRACE_DOWNLOAD_TIMEOUT="${TCPQUALITY_NEXTTRACE_DOWNLOAD_TIMEOUT:-600}"
 DEBUG_MODE=0
 MIN_ROOTFS_FREE_KB=$((700 * 1024))
 
@@ -33,7 +30,7 @@ usage() {
 用法:
   sudo ./runTcpQuality-rootfs.sh [选项] [-- 主脚本参数]
 
-不带主脚本参数时进入交互式菜单；带参数时直接透传给检测 core。
+不带主脚本参数时，运行“上海三网 TCP 丢包/延迟 + 回程线路 + 国际互连”。
 
 选项:
   --distro debian|alpine  rootfs 类型，默认 debian
@@ -43,13 +40,12 @@ usage() {
   环境变量 TCPQUALITY_ROOTFS_SOURCE=github|ibsgss|docker 可强制下载源
   --output DIR            保存 CSV/调试压缩包，默认宿主机 /tmp
   --keep                  保留本次创建的临时 rootfs，便于调试
-  --allow-speedtest       允许北京三段限速测速修改宿主 qdisc/ifb（高风险，默认禁止）
   -h, --help              显示帮助
 
 示例:
-  sudo ./runTcpQuality-rootfs.sh -- -v4 --intl
-  sudo ./runTcpQuality-rootfs.sh --distro alpine -- -v4 -c 5
-  sudo ./runTcpQuality-rootfs.sh --allow-speedtest -- --all
+  sudo ./runTcpQuality-rootfs.sh
+  sudo ./runTcpQuality-rootfs.sh -- -v4
+  sudo ./runTcpQuality-rootfs.sh -- --speedtest
 
 注意:
   --rootfs 指定的已有 rootfs 会安装依赖并更新 resolv.conf，不是只读使用。
@@ -59,109 +55,6 @@ EOF
 
 die() { echo "[X] $*" >&2; exit 1; }
 need_cmd() { command -v "$1" >/dev/null 2>&1 || die "缺少命令: $1"; }
-
-print_interactive_intro() {
-  cat <<'EOF'
-
-TcpQuality TCP 重传检测--最贴近你上网的综合体验
-
-EOF
-}
-
-prompt_answer() {
-  local prompt="$1" default_value="${2:-}" answer
-  if [ -r /dev/tty ]; then
-    printf "%s" "$prompt" > /dev/tty
-    IFS= read -r answer < /dev/tty || answer=""
-  else
-    printf "%s" "$prompt" >&2
-    IFS= read -r answer || answer=""
-  fi
-  [ -n "$answer" ] || answer="$default_value"
-  printf "%s" "$answer"
-}
-
-answer_is_yes() {
-  case "$1" in
-    y|Y|yes|YES|Yes|是|好) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-answer_is_no() {
-  case "$1" in
-    n|N|no|NO|No|否|不) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-configure_interactive_args() {
-  local answer run_route=0 run_edu=0 run_intl=0 run_speedtest=0 upload_rank=1
-  local -a selected_args=()
-
-  print_interactive_intro
-
-  answer=$(prompt_answer "运行三网回程测试？（包含 IPv4/IPv6 和 IPv4大包，回车默认 'y'）[y/n]：" "y")
-  answer_is_no "$answer" || run_route=1
-
-  answer=$(prompt_answer "运行教育网回程测试？（CERNET/CERNET2，回车默认 'y'）[y/n]：" "y")
-  answer_is_no "$answer" || run_edu=1
-
-  answer=$(prompt_answer "运行国际互联测试？（回车默认 'y'）[y/n]：" "y")
-  answer_is_no "$answer" || run_intl=1
-
-  answer=$(prompt_answer "运行三网单线程速度？（回车默认 'y'）[y/n]：" "y")
-  if ! answer_is_no "$answer"; then
-    if [ "$DISTRO" = alpine ]; then
-      die "Alpine 实验模式不运行三网单线程速度；请使用默认 Debian rootfs"
-    fi
-    run_speedtest=1
-    ALLOW_SPEEDTEST=1
-  fi
-
-  answer=$(prompt_answer "上传并参与速度排名？（回车默认 'y'）[y/n]：" "y")
-  answer_is_no "$answer" && upload_rank=0
-
-  if [ "$run_route" -eq 0 ]; then
-    if [ "$run_edu" -eq 0 ] && [ "$run_intl" -eq 0 ] && [ "$run_speedtest" -eq 0 ]; then
-      die "未选择任何测试项目"
-    fi
-  fi
-
-  INTERACTIVE_INCLUDE_DEFAULT_ROUTE="$run_route"
-
-  [ "$run_edu" -eq 1 ] && selected_args+=("--cernet")
-  [ "$run_intl" -eq 1 ] && selected_args+=("--intl")
-  if [ "$run_speedtest" -eq 1 ]; then
-    if [ "$run_route" -eq 0 ] && [ "$run_edu" -eq 0 ]; then
-      if [ "$run_intl" -eq 1 ]; then
-        die "国际互联和三网单线程速度单独运行时请分两次执行，或启用三网回程/教育网回程后追加测速"
-      fi
-      selected_args+=("--only-speedtest")
-    else
-      selected_args+=("--speedtest")
-    fi
-  fi
-
-  if [ "$run_route" -eq 1 ] && [ "$run_edu" -eq 1 ] &&
-     [ "$run_intl" -eq 1 ] && [ "$run_speedtest" -eq 1 ]; then
-    selected_args=("--all")
-  fi
-
-  [ "$upload_rank" -eq 0 ] && selected_args+=("--no-rank-upload")
-
-  set -- "${selected_args[@]}"
-  INTERACTIVE_ARGS=("$@")
-}
-
-has_non_debug_args() {
-  local arg
-  for arg in "$@"; do
-    [ "$arg" = "--debug" ] && continue
-    return 0
-  done
-  return 1
-}
 
 has_debug_arg() {
   local arg
@@ -194,7 +87,6 @@ while [ "$#" -gt 0 ]; do
       OUTPUT_DIR="$2"; shift 2
       ;;
     --keep) KEEP_ROOTFS=1; shift ;;
-    --allow-speedtest) ALLOW_SPEEDTEST=1; shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
     *) die "未知参数: $1（主脚本参数请放在 -- 后）" ;;
@@ -229,33 +121,14 @@ fi
 if has_debug_arg "$@"; then
   DEBUG_MODE=1
 fi
-if ! has_non_debug_args "$@"; then
-  configure_interactive_args
-  if [ "$DEBUG_MODE" -eq 1 ]; then
-    set -- "${INTERACTIVE_ARGS[@]}" --debug
-  else
-    set -- "${INTERACTIVE_ARGS[@]}"
-  fi
-fi
 if [ "$#" -gt 0 ]; then
   printf "[i] 主脚本参数:"
   printf " %q" "$@"
   printf "\n"
 else
-  echo "[i] 主脚本参数: 默认三网回程测试"
+  echo "[i] 主脚本参数: 默认上海三网 TCP 丢包/延迟 + 回程线路 + 国际互连"
 fi
 
-for arg in "$@"; do
-  case "$arg" in
-    --speedtest-staged|--only-speedtest-staged)
-      if [ "$DISTRO" = alpine ]; then
-        die "Alpine 实验模式不运行北京三网三段限速测试；请使用默认 Debian rootfs"
-      fi
-      [ "$ALLOW_SPEEDTEST" -eq 1 ] ||
-        die "rootfs 模式默认禁止北京三段限速测速修改宿主 qdisc/ifb；确认风险后使用 --allow-speedtest"
-      ;;
-  esac
-done
 
 ARCH=$(uname -m)
 case "$ARCH" in
@@ -421,57 +294,6 @@ verify_sha256() {
   else
     die "缺少 SHA256 校验工具（sha256sum 或 shasum）"
   fi
-}
-
-download_nexttrace_guest() {
-  local asset_arch asset_name api_json asset_meta url digest binary
-  case "$ARCH" in
-    x86_64|amd64) asset_arch=amd64 ;;
-    aarch64|arm64) asset_arch=arm64 ;;
-    armv7l|armv7) asset_arch=armv7 ;;
-    armv6l|armv6) asset_arch=armv6 ;;
-    *) return 1 ;;
-  esac
-  asset_name="nexttrace-tiny_linux_${asset_arch}"
-  api_json=$(curl -fsSL --retry 3 --connect-timeout 15 --max-time 60 "$NEXTTRACE_RELEASE_API" 2>/dev/null || true)
-  if [ -n "$api_json" ]; then
-    asset_meta=$(printf '%s\n' "$api_json" | awk -v name="$asset_name" '
-      index($0, "\"name\": \"" name "\"") { found=1 }
-      found && index($0, "\"digest\":") {
-        line=$0
-        sub(/^.*"digest": "sha256:/, "", line)
-        sub(/".*$/, "", line)
-        digest=line
-      }
-      found && index($0, "\"browser_download_url\":") {
-        line=$0
-        sub(/^.*"browser_download_url": "/, "", line)
-        sub(/".*$/, "", line)
-        url=line
-      }
-      found && url { print digest "|" url; exit }
-    ') || true
-    digest=${asset_meta%%|*}
-    url=${asset_meta#*|}
-  fi
-  if [ -z "$url" ]; then
-    digest=
-    url="https://github.com/nxtrace/NTrace-core/releases/latest/download/$asset_name"
-  fi
-
-  binary="$RUNTIME_DIR/$asset_name"
-  curl -fL --retry 3 --retry-all-errors --continue-at - \
-    --connect-timeout 15 --max-time "$NEXTTRACE_DOWNLOAD_TIMEOUT" \
-    "$url" -o "$binary" ||
-    return 1
-  if [ -n "$digest" ]; then
-    verify_sha256 "$digest" "$binary" || return 1
-  fi
-  cp "$binary" "$ROOTFS_DIR/usr/local/bin/nexttrace-tiny"
-  chmod 0755 "$ROOTFS_DIR/usr/local/bin/nexttrace-tiny"
-  rm -f -- "$binary"
-  env -i HOME=/root "PATH=$GUEST_PATH" TERM=dumb \
-    chroot "$ROOTFS_DIR" /usr/local/bin/nexttrace-tiny -V >/dev/null 2>&1
 }
 
 download_extract() {
@@ -907,41 +729,10 @@ install_guest_deps() {
 }
 
 prepare_guest_files() {
-  local nexttrace_path arg
   mkdir -p "$ROOTFS_DIR/root" "$ROOTFS_DIR/usr/local/bin"
   cp "$TARGET_SCRIPT" "$ROOTFS_DIR/root/runTcpQuality.sh"
   chmod 0755 "$ROOTFS_DIR/root/runTcpQuality.sh"
-
-  for arg in "$@"; do
-    if [ "$arg" = "--only-speedtest" ]; then
-      echo "[i] 单线程测速无需 nexttrace-tiny，已跳过下载"
-      return 0
-    fi
-  done
-
-  if [ -x "$ROOTFS_DIR/usr/local/bin/nexttrace-tiny" ] &&
-     env -i HOME=/root "PATH=$GUEST_PATH" TERM=dumb \
-       chroot "$ROOTFS_DIR" /usr/local/bin/nexttrace-tiny -V >/dev/null 2>&1; then
-    echo "[√] 预构建 rootfs 已包含 nexttrace-tiny"
-    return 0
-  fi
-
-  if download_nexttrace_guest; then
-    return 0
-  fi
-  echo "[!] 官方 nexttrace-tiny 下载或校验失败，尝试使用宿主 nexttrace-tiny/nexttrace" >&2
-  nexttrace_path=$(command -v nexttrace-tiny 2>/dev/null || command -v nexttrace 2>/dev/null || true)
-  if [ -n "$nexttrace_path" ] && [ -f "$nexttrace_path" ]; then
-    cp -L "$nexttrace_path" "$ROOTFS_DIR/usr/local/bin/nexttrace-tiny"
-    chmod 0755 "$ROOTFS_DIR/usr/local/bin/nexttrace-tiny"
-    if ! env -i HOME=/root "PATH=$GUEST_PATH" TERM=dumb \
-      chroot "$ROOTFS_DIR" /usr/local/bin/nexttrace-tiny -V >/dev/null 2>&1; then
-      rm -f -- "$ROOTFS_DIR/usr/local/bin/nexttrace-tiny"
-      echo "[!] 宿主 nexttrace-tiny/nexttrace 无法在 rootfs 内运行，IPv4大包回程将跳过" >&2
-    fi
-  else
-    echo "[!] 未找到可用 nexttrace-tiny/nexttrace，IPv4大包回程将跳过" >&2
-  fi
+  # 上海精简版默认不做 IPv4 大包测试，因此不再下载 nexttrace-tiny。
 }
 
 mkdir -p "$OUTPUT_DIR" || die "无法创建输出目录: $OUTPUT_DIR"
@@ -972,9 +763,6 @@ guest_env=(
   "TERM=$guest_term"
   TCPQUALITY_INSIDE_ROOTFS=1
 )
-if [ "${INTERACTIVE_INCLUDE_DEFAULT_ROUTE:-0}" -eq 1 ]; then
-  guest_env+=(TCPQUALITY_INCLUDE_DEFAULT_ROUTE=1)
-fi
 for env_name in \
   GET_NODES_URL TCPQUALITY_REPORT_API TCPQUALITY_RANK_SESSION_API \
   HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY \

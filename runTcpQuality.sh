@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# TcpQuality 默认入口。
+# TcpQuality 上海三网精简版入口（保留国际互连与回程线路）。
 # 旧命令保持不变：
 #   bash <(curl -fsSL https://raw.githubusercontent.com/ibsgss/TcpQuality/main/runTcpQuality.sh)
 #   bash <(curl -fsSL https://tcpquality.ibsgss.uk/run)
@@ -42,11 +42,11 @@ ORIGINAL_ARGS=("$@")
 NO_ROOTFS=0
 KEEP_ROOTFS=0
 ROOTFS_DEBUG=0
-ALLOW_SPEEDTEST_STAGED=0
 ROOTFS_DISTRO="${TCPQUALITY_ROOTFS_DISTRO:-debian}"
 ROOTFS_EXTRA_ARGS=()
 CORE_ARGS=()
 TEMP_DIR=""
+FORCE_MENU=0
 
 usage() {
   cat <<'EOF'
@@ -57,16 +57,39 @@ usage() {
   --no-rootfs          不使用 rootfs，直接在宿主环境运行检测 core
   --rootfs-distro NAME rootfs 类型：debian 或 alpine，默认 debian
   --debug-rootfs       保留临时 rootfs，便于调试
-  --allow-speedtest-staged
-                       允许北京三段限速测速修改宿主 qdisc/ifb
+  --menu               显示交互式测试菜单
 
 主脚本参数:
-  其余参数会原样透传给 runTcpQuality-core.sh。例如 -v4、--intl、--all。
+  其余参数会原样透传给 runTcpQuality-core.sh。例如 -v4、--speedtest、--route。默认运行含上海三网回程线路与国际互连。
 EOF
 }
 
 cleanup() {
-  [ -n "${TEMP_DIR:-}" ] && [ -d "$TEMP_DIR" ] && rm -rf -- "$TEMP_DIR"
+  [ -n "${TEMP_DIR:-}" ] && [ -d "$TEMP_DIR" ] && rm -rf -- "$TEMP_DIR" || true
+  return 0
+}
+
+show_menu() {
+  local choice=""
+  while true; do
+    clear 2>/dev/null || true
+    printf '%s
+'       ''       '============================================================'       '  TcpQuality - 上海三网精简测试菜单'       '============================================================'       '  1. 上海三网 TCP 质量 / 丢包 / 延迟'       '  2. 上海三网 回程路由 + 延迟'       '  3. 上海三网 仅回程路由'       '  4. 国际互联测试'       '  5. 上海三网 单线程测速'       '  6. 全部测试'       '  0. 退出'       '============================================================'       ''
+    printf '请选择 [0-6]: '
+    IFS= read -r choice || exit 1
+    case "$choice" in
+      1) CORE_ARGS=(--only-domestic-latency); break ;;
+      2) CORE_ARGS=(--only-domestic); break ;;
+      3) CORE_ARGS=(--route); break ;;
+      4) CORE_ARGS=(--only-intl); break ;;
+      5) CORE_ARGS=(--only-speedtest); break ;;
+      6) CORE_ARGS=(); break ;;
+      0) exit 0 ;;
+      *) printf '
+[!] 无效选项，请重新选择。
+'; sleep 1 ;;
+    esac
+  done
 }
 trap cleanup EXIT
 
@@ -86,8 +109,8 @@ while [ "$#" -gt 0 ]; do
       KEEP_ROOTFS=1
       shift
       ;;
-    --allow-speedtest-staged)
-      ALLOW_SPEEDTEST_STAGED=1
+    --menu)
+      FORCE_MENU=1
       shift
       ;;
     --rootfs-help)
@@ -118,6 +141,10 @@ case "$ROOTFS_DISTRO" in
   debian|alpine) ;;
   *) echo "[X] --rootfs-distro 只能是 debian 或 alpine" >&2; exit 1 ;;
 esac
+
+if [ "$FORCE_MENU" -eq 1 ] || [ "${#CORE_ARGS[@]}" -eq 0 ]; then
+  show_menu
+fi
 
 run_core_direct() {
   local core="$LOCAL_CORE"
@@ -160,7 +187,6 @@ fi
 
 ROOTFS_EXTRA_ARGS+=(--distro "$ROOTFS_DISTRO")
 [ "$KEEP_ROOTFS" -eq 1 ] && ROOTFS_EXTRA_ARGS+=(--keep)
-[ "$ALLOW_SPEEDTEST_STAGED" -eq 1 ] && ROOTFS_EXTRA_ARGS+=(--allow-speedtest)
 
 if [ -f "$LOCAL_ROOTFS" ] && [ -f "$LOCAL_CORE" ]; then
   export TCPQUALITY_CORE_SCRIPT="$LOCAL_CORE"
