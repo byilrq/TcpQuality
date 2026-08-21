@@ -5,6 +5,8 @@
 
 set -e
 
+TCPQUALITY_BUILD_ID="shanghai-menu-v4"
+
 # ===================== NixOS 临时运行环境 =====================
 is_nixos() {
   [ -e /etc/NIXOS ] || {
@@ -244,7 +246,7 @@ check_nexttrace() {
   if command -v nexttrace-tiny &>/dev/null; then
     return 0
   fi
-  echo -e "${YELLOW}[!] 未检测到 nexttrace-tiny，已跳过 IPv4大包回程${NC}"
+  echo -e "${YELLOW}[!] 未检测到 nexttrace-tiny，将回退 traceroute；每跳延迟仍可显示，但地理位置可能不完整${NC}"
   return 1
 }
 
@@ -286,6 +288,8 @@ ONLY_IPV4=0
 ONLY_IPV6=0
 ONLY_LARGE=0
 ROUTE_MODE=0
+ROUTE_HOPS_MODE=0
+ROUTE_HOPS_AFTER=0
 ROUTE_PROTOCOL="tcp"
 ROUTE_ACTIVE_PREFIX=""
 DOMESTIC_ROUTE_ENABLED=1
@@ -647,7 +651,9 @@ TcpQuality 上海三网精简版（保留国际互连 + 回程线路）
   --only-domestic-latency
                      仅测上海三网 TCP 丢包与延迟，不跑 traceroute
   --only-intl       仅测国际网站/CDN 与国际 iPerf3 互联
-  --route           仅做上海三网回程线路识别，不执行丢包/延迟和国际互连
+  --route           兼容旧模式：上海三网回程线路类型汇总
+  --route-hops      上海三网逐跳回程：每跳显示 IP / ASN / 地理位置 / 延迟
+  --route-latency   上海三网 TCP 丢包/延迟 + 逐跳回程（不跑国际）
   --route-protocol PROTO
                      traceroute 协议: tcp、udp、both，默认 tcp
   --speedtest       在默认测试后追加上海三网单线程测速
@@ -701,6 +707,8 @@ parse_args() {
       --only-domestic-latency) INTERNATIONAL_ENABLED=0; DOMESTIC_ROUTE_ENABLED=0; shift ;;
       --only-intl) INTERNATIONAL_ENABLED=1; INTERNATIONAL_ONLY=1; shift ;;
       --route) ROUTE_MODE=1; UPLOAD_REPORT=0; shift ;;
+      --route-hops) ROUTE_HOPS_MODE=1; UPLOAD_REPORT=0; INTERNATIONAL_ENABLED=0; shift ;;
+      --route-latency) INTERNATIONAL_ENABLED=0; DOMESTIC_ROUTE_ENABLED=0; ROUTE_HOPS_AFTER=1; UPLOAD_REPORT=0; shift ;;
       --route-protocol)
         if [ -z "${2:-}" ] || { [ "$2" != "tcp" ] && [ "$2" != "udp" ] && [ "$2" != "both" ]; }; then
           echo -e "${RED}[X] --route-protocol 只支持 tcp、udp、both${NC}" >&2
@@ -2529,7 +2537,11 @@ run_route_mode() {
   ROUTE_ACTIVE_PREFIX="$prefix"
 
   check_curl
-  require_remote_nodes "v${family}"
+  if [ "$family" = "4" ]; then
+    [ "${#REMOTE_CDN4_NODES[@]}" -gt 0 ] || require_remote_nodes "v4"
+  else
+    [ "${#REMOTE_CDN6_NODES[@]}" -gt 0 ] || require_remote_nodes "v6"
+  fi
   check_traceroute
   if [ "$family" = "6" ]; then
     if ! ipv6_available; then
@@ -2625,6 +2637,68 @@ run_route_mode() {
     echo ""
   fi
   rm -f "$route_raw_file" "$route_file" "$ip_file" "$cymru_file" "$asn_map_file"
+}
+
+
+run_route_hops_one() {
+  local family="$1" isp="$2" host="$3" target_ip="$4" port="${5:-80}" fam_flag="-4" output rc
+  [ "$family" = "6" ] && fam_flag="-6"
+  echo -e "${BOLD}${CYAN}  上海${isp} IPv${family}${NC}  ${DIM}${host} -> ${target_ip}:${port}${NC}"
+  echo -e "${DIM}  每一跳显示路由 IP、ASN/运营商、地理位置及 RTT；* 表示该跳未回应。${NC}"
+  echo
+
+  if command -v nexttrace-tiny >/dev/null 2>&1; then
+    # -M 只关闭路线图，不关闭逐跳表；保留 GeoIP。ip-api.com 无需 token，失败时再用默认 provider。
+    if nexttrace-tiny "$fam_flag" -T -p "$port" --psize 44 -q 3 -m 30 -M -d ip-api.com -g cn "$target_ip"; then
+      echo
+      return 0
+    fi
+    echo -e "${YELLOW}[!] ip-api.com GeoIP 输出失败，尝试 NextTrace 默认地理位置源...${NC}"
+    if nexttrace-tiny "$fam_flag" -T -p "$port" --psize 44 -q 3 -m 30 -M -g cn "$target_ip"; then
+      echo
+      return 0
+    fi
+    echo -e "${YELLOW}[!] NextTrace 执行失败，回退系统 traceroute。${NC}"
+  fi
+
+  check_traceroute
+  if [ "$family" = "6" ]; then
+    traceroute -6 -T -p "$port" -q 3 -w 2 -m 30 "$target_ip" 44 || true
+  else
+    traceroute -4 -T -p "$port" -q 3 -w 2 -m 30 "$target_ip" 44 || true
+  fi
+  echo -e "${DIM}  [i] traceroute 备用模式可显示每跳 IP/主机名和 RTT；精确 ASN/城市需 nexttrace-tiny GeoIP。${NC}"
+  echo
+}
+
+run_detailed_route_mode() {
+  local family="$1" prov isp host fixed_ip port backup_host backup_ip backup_port count=0
+  check_curl
+  if [ "$family" = "4" ]; then
+    [ "${#REMOTE_CDN4_NODES[@]}" -gt 0 ] || require_remote_nodes "v4"
+  else
+    [ "${#REMOTE_CDN6_NODES[@]}" -gt 0 ] || require_remote_nodes "v6"
+  fi
+  if [ "$family" = "4" ]; then
+    ipv4_available || { echo -e "${YELLOW}[!] 未检测到 IPv4，跳过上海三网 IPv4 逐跳回程${NC}"; return 0; }
+  else
+    ipv6_available || { echo -e "${YELLOW}[!] 未检测到 IPv6，跳过上海三网 IPv6 逐跳回程${NC}"; return 0; }
+  fi
+
+  echo -e "${BOLD}${CYAN}  IPv${family} 上海三网逐跳回程路由${NC}"
+  echo -e "${DIM}  范围固定: 上海；目标: 电信 / 联通 / 移动各 1 个节点${NC}"
+  echo
+  while IFS='|' read -r prov isp host fixed_ip port backup_host backup_ip backup_port; do
+    [ "$prov" = "$DOMESTIC_PROVINCE" ] || continue
+    [ -n "$fixed_ip" ] || continue
+    case "$isp" in 电信|联通|移动) ;; *) continue ;; esac
+    count=$((count + 1))
+    run_route_hops_one "$family" "$isp" "$host" "$fixed_ip" "${port:-80}"
+  done < <(print_cdn_entries "$family")
+  if [ "$count" -eq 0 ]; then
+    echo -e "${RED}[X] 未取得上海三网 IPv${family} 节点${NC}"
+    return 1
+  fi
 }
 
 collect_route_labels() {
@@ -5708,7 +5782,7 @@ run_speedtest_mode() {
 
 # ===================== 主流程 =====================
 main() {
-  clear
+  clear 2>/dev/null || true
   print_header
 
   init_privilege
@@ -5721,6 +5795,16 @@ main() {
 
   if [ "$SPEEDTEST_ONLY" -eq 1 ]; then
     run_speedtest_mode
+    exit 0
+  fi
+
+  if [ "$ROUTE_HOPS_MODE" -eq 1 ]; then
+    check_curl
+    detect_ip_stack
+    echo -e "  ${DIM}报告时间：$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S CST（北京时间）')${NC}"
+    echo
+    if [ "$ONLY_IPV6" -ne 1 ]; then run_detailed_route_mode 4; fi
+    if [ "$ONLY_IPV4" -ne 1 ]; then run_detailed_route_mode 6; fi
     exit 0
   fi
 
@@ -6080,6 +6164,13 @@ main() {
     upload_report "$CSV" "${report_time%%（*}"
   fi
   echo ""
+
+  if [ "$ROUTE_HOPS_AFTER" -eq 1 ]; then
+    echo -e "${BOLD}${CYAN}  上海三网逐跳回程明细${NC}"
+    echo
+    if [ "$ONLY_IPV6" -ne 1 ]; then run_detailed_route_mode 4; fi
+    if [ "$ONLY_IPV4" -ne 1 ]; then run_detailed_route_mode 6; fi
+  fi
 
   rm -f "$sorted_v4" "$sorted_v6" "$sorted_large_v4" "$sorted_cernet" "$sorted_cernet2" "$route_labels_v4" "$route_labels_v6" "$route_labels_large_v4" "$edu_route_labels_v4" "$edu_route_labels_v6"
 }

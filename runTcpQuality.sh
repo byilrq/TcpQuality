@@ -13,6 +13,8 @@
 
 set -Eeuo pipefail
 
+TCPQUALITY_BUILD_ID="shanghai-menu-v4"
+
 RAW_BASE="${TCPQUALITY_RAW_BASE:-https://raw.githubusercontent.com/ibsgss/TcpQuality/main}"
 case "$RAW_BASE" in
   http://*|https://*) ;;
@@ -74,13 +76,13 @@ show_menu() {
   while true; do
     clear 2>/dev/null || true
     printf '%s
-'       ''       '============================================================'       '  TcpQuality - 上海三网精简测试菜单'       '============================================================'       '  1. 上海三网 TCP 质量 / 丢包 / 延迟'       '  2. 上海三网 回程路由 + 延迟'       '  3. 上海三网 仅回程路由'       '  4. 国际互联测试'       '  5. 上海三网 单线程测速'       '  6. 全部测试'       '  0. 退出'       '============================================================'       ''
+'       ''       '============================================================'       '  TcpQuality - 上海三网精简测试菜单'       '============================================================'       '  1. 上海三网 TCP 质量 / 丢包 / 延迟'       '  2. 上海三网 延迟 + 逐跳回程（IPv4）'       '  3. 上海三网 逐跳回程路由（IPv4）'       '     每一跳显示 IP / ASN / 地理位置 / 延迟'       '  4. 国际互联测试'       '  5. 上海三网 单线程测速'       '  6. 全部测试'       '  0. 退出'       '============================================================'       ''
     printf '请选择 [0-6]: '
     IFS= read -r choice || exit 1
     case "$choice" in
       1) CORE_ARGS=(--only-domestic-latency); break ;;
-      2) CORE_ARGS=(--only-domestic); break ;;
-      3) CORE_ARGS=(--route); break ;;
+      2) CORE_ARGS=(--route-latency -v4); break ;;
+      3) CORE_ARGS=(--route-hops -v4); break ;;
       4) CORE_ARGS=(--only-intl); break ;;
       5) CORE_ARGS=(--only-speedtest); break ;;
       6) CORE_ARGS=(); break ;;
@@ -91,6 +93,23 @@ show_menu() {
     esac
   done
 }
+verify_local_bundle() {
+  local f marker="TCPQUALITY_BUILD_ID=\"${TCPQUALITY_BUILD_ID}\""
+  for f in "$LOCAL_CORE" "$LOCAL_ROOTFS"; do
+    if [ ! -f "$f" ]; then
+      echo "[X] 缺少同版本文件: $f" >&2
+      echo "[i] 请完整解压压缩包后，在同一目录运行 runTcpQuality.sh；不要只替换入口脚本。" >&2
+      exit 1
+    fi
+    if ! grep -Fq "$marker" "$f"; then
+      echo "[X] TcpQuality 三文件版本不一致: $(basename "$f")" >&2
+      echo "[i] 当前入口版本: $TCPQUALITY_BUILD_ID。请删除旧文件后完整解压新版压缩包。" >&2
+      exit 1
+    fi
+  done
+}
+
+verify_local_bundle
 trap cleanup EXIT
 
 while [ "$#" -gt 0 ]; do
@@ -147,15 +166,7 @@ if [ "$FORCE_MENU" -eq 1 ] || [ "${#CORE_ARGS[@]}" -eq 0 ]; then
 fi
 
 run_core_direct() {
-  local core="$LOCAL_CORE"
-  if [ ! -f "$core" ]; then
-    TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/tcpquality-entry.XXXXXX")
-    core="$TEMP_DIR/runTcpQuality-core.sh"
-    curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 \
-      "$RAW_BASE/runTcpQuality-core.sh" -o "$core"
-    chmod 0755 "$core"
-  fi
-  exec bash "$core" "${CORE_ARGS[@]}"
+  exec bash "$LOCAL_CORE" "${CORE_ARGS[@]}"
 }
 
 if [ "$NO_ROOTFS" -eq 1 ] || [ "${TCPQUALITY_INSIDE_ROOTFS:-0}" -eq 1 ]; then
@@ -171,8 +182,10 @@ if [ "$(id -u)" -ne 0 ]; then
   if command -v sudo >/dev/null 2>&1; then
     TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/tcpquality-entry.XXXXXX")
     temp_entry="$TEMP_DIR/runTcpQuality.sh"
-    cat "$0" > "$temp_entry"
-    chmod 0755 "$temp_entry"
+    cp "$0" "$temp_entry"
+    cp "$LOCAL_CORE" "$TEMP_DIR/runTcpQuality-core.sh"
+    cp "$LOCAL_ROOTFS" "$TEMP_DIR/runTcpQuality-rootfs.sh"
+    chmod 0755 "$temp_entry" "$TEMP_DIR/runTcpQuality-core.sh" "$TEMP_DIR/runTcpQuality-rootfs.sh"
     exec sudo -E bash -c '
       dir=$1
       script=$2
@@ -188,18 +201,5 @@ fi
 ROOTFS_EXTRA_ARGS+=(--distro "$ROOTFS_DISTRO")
 [ "$KEEP_ROOTFS" -eq 1 ] && ROOTFS_EXTRA_ARGS+=(--keep)
 
-if [ -f "$LOCAL_ROOTFS" ] && [ -f "$LOCAL_CORE" ]; then
-  export TCPQUALITY_CORE_SCRIPT="$LOCAL_CORE"
-  exec bash "$LOCAL_ROOTFS" "${ROOTFS_EXTRA_ARGS[@]}" -- "${CORE_ARGS[@]}"
-fi
-
-TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/tcpquality-entry.XXXXXX")
-rootfs_runner="$TEMP_DIR/runTcpQuality-rootfs.sh"
-core_script="$TEMP_DIR/runTcpQuality-core.sh"
-curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 \
-  "$RAW_BASE/runTcpQuality-rootfs.sh" -o "$rootfs_runner"
-curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 \
-  "$RAW_BASE/runTcpQuality-core.sh" -o "$core_script"
-chmod 0755 "$rootfs_runner" "$core_script"
-export TCPQUALITY_CORE_SCRIPT="$core_script"
-exec bash "$rootfs_runner" "${ROOTFS_EXTRA_ARGS[@]}" -- "${CORE_ARGS[@]}"
+ROOTFS_EXTRA_ARGS+=(--core "$LOCAL_CORE")
+exec bash "$LOCAL_ROOTFS" "${ROOTFS_EXTRA_ARGS[@]}" -- "${CORE_ARGS[@]}"

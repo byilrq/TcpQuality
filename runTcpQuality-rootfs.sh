@@ -4,10 +4,11 @@
 # remain representative of the VPS. This wrapper never uses proot.
 set -Eeuo pipefail
 
+TCPQUALITY_BUILD_ID="shanghai-menu-v4"
+
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 SELF_SCRIPT="$SCRIPT_DIR/runTcpQuality-rootfs.sh"
-TARGET_SCRIPT="${TCPQUALITY_CORE_SCRIPT:-$SCRIPT_DIR/runTcpQuality-core.sh}"
-[ -f "$TARGET_SCRIPT" ] || TARGET_SCRIPT="$SCRIPT_DIR/runTcpQuality.sh"
+TARGET_SCRIPT="$SCRIPT_DIR/runTcpQuality-core.sh"
 ORIGINAL_ARGS=("$@")
 DISTRO="debian"
 ROOTFS_DIR=""
@@ -24,6 +25,9 @@ OUTPUT_DIR="${TCPQUALITY_OUTPUT_DIR:-/tmp}"
 GUEST_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 DEBUG_MODE=0
 MIN_ROOTFS_FREE_KB=$((700 * 1024))
+ROOTFS_CACHE_DIR="${TCPQUALITY_ROOTFS_CACHE_DIR:-/var/cache/tcpquality}"
+NEXTTRACE_RELEASE_API=https://api.github.com/repos/nxtrace/NTrace-core/releases/latest
+NEXTTRACE_DOWNLOAD_TIMEOUT="${TCPQUALITY_NEXTTRACE_DOWNLOAD_TIMEOUT:-600}"
 
 usage() {
   cat <<'EOF'
@@ -34,12 +38,14 @@ usage() {
 
 选项:
   --distro debian|alpine  rootfs 类型，默认 debian
+  --core FILE             明确指定本包 runTcpQuality-core.sh（入口脚本自动传入）
   --rootfs DIR            使用已有 rootfs，不下载、不删除
   --url URL               使用自定义 rootfs tar(.gz/.xz/.zst)
   --sha256 HEX            校验自定义 rootfs 下载文件
   环境变量 TCPQUALITY_ROOTFS_SOURCE=github|ibsgss|docker 可强制下载源
   --output DIR            保存 CSV/调试压缩包，默认宿主机 /tmp
   --keep                  保留本次创建的临时 rootfs，便于调试
+  环境变量 TCPQUALITY_ROOTFS_CACHE_DIR 可修改 rootfs 下载缓存目录
   -h, --help              显示帮助
 
 示例:
@@ -74,6 +80,10 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -ge 2 ] || die "--rootfs 缺少参数"
       ROOTFS_DIR="$2"; shift 2
       ;;
+    --core)
+      [ "$#" -ge 2 ] || die "--core 缺少参数"
+      TARGET_SCRIPT="$2"; shift 2
+      ;;
     --url)
       [ "$#" -ge 2 ] || die "--url 缺少参数"
       ROOTFS_URL="$2"; shift 2
@@ -102,6 +112,7 @@ esac
 [ -z "$ROOTFS_SHA256" ] || [ -n "$ROOTFS_URL" ] ||
   die "--sha256 只能与 --url 一起使用"
 [ -f "$TARGET_SCRIPT" ] || die "找不到 $TARGET_SCRIPT"
+grep -Fq "TCPQUALITY_BUILD_ID=\"${TCPQUALITY_BUILD_ID}\"" "$TARGET_SCRIPT" || die "core 与 rootfs 版本不一致；请完整解压同一版压缩包"
 [ -f "$SELF_SCRIPT" ] || die "找不到 $SELF_SCRIPT"
 [ "$(id -u)" -eq 0 ] || die "rootfs/chroot 运行需要 root 权限"
 [ "$(uname -s)" = Linux ] || die "rootfs/chroot 模式仅支持 Linux；macOS/Windows 请使用 Docker 开发模式"
@@ -296,6 +307,53 @@ verify_sha256() {
   fi
 }
 
+
+download_nexttrace_guest() {
+  local asset_arch asset_name api_json asset_meta url digest binary
+  case "$ARCH" in
+    x86_64|amd64) asset_arch=amd64 ;;
+    aarch64|arm64) asset_arch=arm64 ;;
+    armv7l|armv7) asset_arch=armv7 ;;
+    armv6l|armv6) asset_arch=armv6 ;;
+    *) return 1 ;;
+  esac
+  asset_name="nexttrace-tiny_linux_${asset_arch}"
+  api_json=$(curl -fsSL --retry 3 --connect-timeout 15 --max-time 60 "$NEXTTRACE_RELEASE_API" 2>/dev/null || true)
+  if [ -n "$api_json" ]; then
+    asset_meta=$(printf '%s\n' "$api_json" | awk -v name="$asset_name" '
+      index($0, "\"name\": \"" name "\"") { found=1 }
+      found && index($0, "\"digest\":") {
+        line=$0
+        sub(/^.*"digest": "sha256:/, "", line)
+        sub(/".*$/, "", line)
+        digest=line
+      }
+      found && index($0, "\"browser_download_url\":") {
+        line=$0
+        sub(/^.*"browser_download_url": "/, "", line)
+        sub(/".*$/, "", line)
+        url=line
+      }
+      found && url { print digest "|" url; exit }
+    ' || true)
+    digest=${asset_meta%%|*}
+    url=${asset_meta#*|}
+  fi
+  if [ -z "${url:-}" ]; then
+    digest=""
+    url="https://github.com/nxtrace/NTrace-core/releases/latest/download/$asset_name"
+  fi
+  binary="$RUNTIME_DIR/$asset_name"
+  curl -fL --retry 3 --retry-all-errors --continue-at - --connect-timeout 15 --max-time "$NEXTTRACE_DOWNLOAD_TIMEOUT" "$url" -o "$binary" || return 1
+  if [ -n "${digest:-}" ]; then
+    verify_sha256 "$digest" "$binary" || return 1
+  fi
+  cp "$binary" "$ROOTFS_DIR/usr/local/bin/nexttrace-tiny"
+  chmod 0755 "$ROOTFS_DIR/usr/local/bin/nexttrace-tiny"
+  rm -f -- "$binary"
+  env -i HOME=/root "PATH=$GUEST_PATH" TERM=dumb chroot "$ROOTFS_DIR" /usr/local/bin/nexttrace-tiny -V >/dev/null 2>&1
+}
+
 download_extract() {
   local url="$1" archive="$2" checksum="${3:-}"
   echo "[i] 下载 rootfs: $url"
@@ -358,42 +416,71 @@ parse_rootfs_manifest() {
 }
 
 download_prebuilt_debian_from() {
-  local source="$1" base manifest archive metadata file checksum expected_size actual_size
+  local source="$1" base manifest archive metadata file checksum expected_size actual_size cache_file ext
   base=$(rootfs_source_base "$source") || return 1
   manifest="$TEMP_ROOT_PARENT/rootfs-manifest-${source}.json"
-  archive="$TEMP_ROOT_PARENT/debian-rootfs-${source}.tar.gz"
   echo "[i] 尝试 ${source} 预构建 rootfs: ${ROOTFS_RELEASE_TAG}"
-  curl -fsSL --retry 2 --connect-timeout 10 --max-time 45 \
-    "$base/rootfs-manifest.json" -o "$manifest" || return 1
+  curl -fsSL --retry 2 --connect-timeout 10 --max-time 45 "$base/rootfs-manifest.json" -o "$manifest" || return 1
   metadata=$(parse_rootfs_manifest "$manifest" "$DEBIAN_ARCH") || return 1
   [ -n "$metadata" ] || return 1
   IFS='|' read -r file checksum expected_size <<< "$metadata"
   case "$file" in
-    tcpquality-rootfs-*.tar.gz) ;;
+    tcpquality-rootfs-*.tar.gz|tcpquality-rootfs-*.tgz|tcpquality-rootfs-*.tar.xz|tcpquality-rootfs-*.tar.zst) ;;
     *) return 1 ;;
   esac
-  echo "[i] 下载 rootfs: $base/$file"
-  curl -fL --retry 3 --connect-timeout 15 --max-time 600 \
-    "$base/$file" -o "$archive" || return 1
-  actual_size=$(wc -c < "$archive" | tr -d ' ')
-  if [ "$actual_size" != "$expected_size" ]; then
-    echo "[!] ${source} rootfs 大小校验失败: expected=$expected_size actual=$actual_size" >&2
-    rm -f -- "$archive"
-    return 1
+
+  if ! mkdir -p "$ROOTFS_CACHE_DIR" 2>/dev/null; then
+    ROOTFS_CACHE_DIR="${TMPDIR:-/tmp}/tcpquality-cache"
+    mkdir -p "$ROOTFS_CACHE_DIR" || return 1
   fi
-  if ! verify_sha256 "$checksum" "$archive"; then
-    echo "[!] ${source} rootfs SHA256 校验失败" >&2
-    rm -f -- "$archive"
-    return 1
+  cache_file="$ROOTFS_CACHE_DIR/$file"
+  archive="$cache_file"
+
+  if [ -f "$cache_file" ]; then
+    actual_size=$(wc -c < "$cache_file" | tr -d ' ')
+    if [ "$actual_size" = "$expected_size" ] && verify_sha256 "$checksum" "$cache_file"; then
+      echo "[√] 使用已缓存 rootfs: $cache_file"
+    else
+      echo "[!] rootfs 缓存校验失败，重新下载" >&2
+      rm -f -- "$cache_file"
+    fi
   fi
+
+  if [ ! -f "$cache_file" ]; then
+    local tmp_archive="$TEMP_ROOT_PARENT/$file.download"
+    echo "[i] 下载 rootfs: $base/$file"
+    curl -fL --retry 3 --connect-timeout 15 --max-time 600 "$base/$file" -o "$tmp_archive" || return 1
+    actual_size=$(wc -c < "$tmp_archive" | tr -d ' ')
+    if [ "$actual_size" != "$expected_size" ]; then
+      echo "[!] ${source} rootfs 大小校验失败: expected=$expected_size actual=$actual_size" >&2
+      rm -f -- "$tmp_archive"
+      return 1
+    fi
+    if ! verify_sha256 "$checksum" "$tmp_archive"; then
+      echo "[!] ${source} rootfs SHA256 校验失败" >&2
+      rm -f -- "$tmp_archive"
+      return 1
+    fi
+    mv -f -- "$tmp_archive" "$cache_file"
+    echo "[√] rootfs 已缓存: $cache_file"
+  fi
+
   rm -rf -- "$ROOTFS_DIR"
   mkdir -p "$ROOTFS_DIR"
-  if ! tar -xzf "$archive" -C "$ROOTFS_DIR"; then
-    rm -rf -- "$ROOTFS_DIR"
-    mkdir -p "$ROOTFS_DIR"
-    return 1
-  fi
-  rm -f -- "$archive"
+  case "$archive" in
+    *.tar.gz|*.tgz) tar -xzf "$archive" -C "$ROOTFS_DIR" || return 1 ;;
+    *.tar.xz) tar -xJf "$archive" -C "$ROOTFS_DIR" || return 1 ;;
+    *.tar.zst)
+      if tar --help 2>&1 | grep -q -- '--zstd'; then
+        tar --zstd -xf "$archive" -C "$ROOTFS_DIR" || return 1
+      elif command -v unzstd >/dev/null 2>&1; then
+        unzstd -c "$archive" | tar -xf - -C "$ROOTFS_DIR" || return 1
+      else
+        return 1
+      fi
+      ;;
+    *) return 1 ;;
+  esac
   [ -r "$ROOTFS_DIR/etc/os-release" ] || return 1
   echo "[√] 已使用 ${source} 预构建 rootfs"
 }
@@ -729,10 +816,40 @@ install_guest_deps() {
 }
 
 prepare_guest_files() {
+  local nexttrace_path arg need_nexttrace=0
   mkdir -p "$ROOTFS_DIR/root" "$ROOTFS_DIR/usr/local/bin"
-  cp "$TARGET_SCRIPT" "$ROOTFS_DIR/root/runTcpQuality.sh"
-  chmod 0755 "$ROOTFS_DIR/root/runTcpQuality.sh"
-  # 上海精简版默认不做 IPv4 大包测试，因此不再下载 nexttrace-tiny。
+  cp "$TARGET_SCRIPT" "$ROOTFS_DIR/root/runTcpQuality-core.sh"
+  chmod 0755 "$ROOTFS_DIR/root/runTcpQuality-core.sh"
+  grep -Fq "TCPQUALITY_BUILD_ID=\"${TCPQUALITY_BUILD_ID}\"" "$ROOTFS_DIR/root/runTcpQuality-core.sh" || die "注入 guest 的 core 版本错误"
+  echo "[√] 已注入当前目录 core: ${TCPQUALITY_BUILD_ID}"
+
+  for arg in "$@"; do
+    case "$arg" in
+      --route-hops|--route-latency) need_nexttrace=1 ;;
+    esac
+  done
+  [ "$need_nexttrace" -eq 1 ] || return 0
+
+  if [ -x "$ROOTFS_DIR/usr/local/bin/nexttrace-tiny" ] &&
+     env -i HOME=/root "PATH=$GUEST_PATH" TERM=dumb chroot "$ROOTFS_DIR" /usr/local/bin/nexttrace-tiny -V >/dev/null 2>&1; then
+    echo "[√] 逐跳路由工具 nexttrace-tiny 已就绪"
+    return 0
+  fi
+  if download_nexttrace_guest; then
+    echo "[√] nexttrace-tiny 已安装到临时 rootfs"
+    return 0
+  fi
+  nexttrace_path=$(command -v nexttrace-tiny 2>/dev/null || command -v nexttrace 2>/dev/null || true)
+  if [ -n "$nexttrace_path" ] && [ -f "$nexttrace_path" ]; then
+    cp -L "$nexttrace_path" "$ROOTFS_DIR/usr/local/bin/nexttrace-tiny"
+    chmod 0755 "$ROOTFS_DIR/usr/local/bin/nexttrace-tiny"
+    if env -i HOME=/root "PATH=$GUEST_PATH" TERM=dumb chroot "$ROOTFS_DIR" /usr/local/bin/nexttrace-tiny -V >/dev/null 2>&1; then
+      echo "[√] 已复用宿主 nexttrace"
+      return 0
+    fi
+    rm -f -- "$ROOTFS_DIR/usr/local/bin/nexttrace-tiny"
+  fi
+  echo "[!] nexttrace-tiny 不可用；逐跳路由将回退 traceroute，仍显示每跳延迟，但地理位置可能不完整" >&2
 }
 
 mkdir -p "$OUTPUT_DIR" || die "无法创建输出目录: $OUTPUT_DIR"
@@ -773,7 +890,7 @@ for env_name in \
 done
 guest_command=(
   env -i "${guest_env[@]}"
-  chroot "$ROOTFS_DIR" /bin/bash /root/runTcpQuality.sh "$@"
+  chroot "$ROOTFS_DIR" /bin/bash /root/runTcpQuality-core.sh "$@"
 )
 
 set +e
