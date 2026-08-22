@@ -5,7 +5,7 @@
 
 set -e
 
-TCPQUALITY_BUILD_ID="threecity-menu-v11"
+TCPQUALITY_BUILD_ID="threecity-menu-v12"
 
 # ===================== NixOS 临时运行环境 =====================
 is_nixos() {
@@ -2514,7 +2514,7 @@ format_route_rtt() {
 }
 
 # 菜单 3 与用户指定的常用 NextTrace 三网脚本保持一致。
-# 仅保留北京 / 上海 / 深圳三网 9 个目标，不加入成都教育网。
+# 仅保留北京 / 上海 / 广州三网 9 个目标，不加入成都教育网。
 BESTTRACE_ROUTE_TARGETS_V4=(
   "北京|电信|219.141.147.210"
   "上海|电信|202.96.209.133"
@@ -2718,7 +2718,7 @@ run_detailed_route_mode() {
   [ "$total" -gt 0 ] || { echo -e "${RED}[X] 没有可执行的三网固定回程目标${NC}"; return 1; }
 
   echo -e "${BOLD}${CYAN}  IPv4 三网逐跳回程路由${NC}"
-  echo -e "${DIM}  与参考脚本一致：北京 / 上海 / 深圳，电信 / 联通 / 移动，共 9 条；执行 nexttrace -M 目标IP。${NC}"
+  echo -e "${DIM}  与参考脚本一致：北京 / 上海 / 广州，电信 / 联通 / 移动，共 9 条；执行 nexttrace -M 目标IP。${NC}"
   echo -e "${DIM}  -M 关闭 Trace Map；NextTrace 默认使用 ICMP。${NC}"
   echo
 
@@ -2729,11 +2729,7 @@ run_detailed_route_mode() {
 
   for entry in "${selected_targets[@]}"; do
     IFS='|' read -r prov isp target_ip <<< "$entry"
-    if [ "$prov" = "广东" ]; then
-      city="深圳"
-    else
-      city=$(city_display_name "$prov")
-    fi
+    city=$(city_display_name "$prov")
     idx=$((idx + 1))
     printf '%-70s\n' '-' | sed 's/ /-/g'
     echo -e "${BOLD}${CYAN}${city}${isp}${NC}  ${DIM}${target_ip}${NC}"
@@ -5659,7 +5655,7 @@ show_speedtest_results() {
       continue
     fi
     if [ "$label" = "IPv6" ]; then
-      carriers=(深圳移动 重庆移动)
+      carriers=(广州移动 重庆移动)
       speedtest_print_group_header "IPv6" "IPv6"
     else
       carriers=(电信 联通 移动)

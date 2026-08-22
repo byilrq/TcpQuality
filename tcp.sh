@@ -11,7 +11,7 @@
 
 set -Eeuo pipefail
 
-TCPQUALITY_BUILD_ID="threecity-menu-v11"
+TCPQUALITY_BUILD_ID="threecity-menu-v12"
 
 RAW_BASE="${TCPQUALITY_RAW_BASE:-https://raw.githubusercontent.com/byilrq/TcpQuality/main}"
 case "$RAW_BASE" in
@@ -47,6 +47,8 @@ ROOTFS_EXTRA_ARGS=()
 CORE_ARGS=()
 TEMP_DIR=""
 FORCE_MENU=0
+INTERACTIVE_MENU=0
+MENU_EXIT=0
 
 usage() {
   cat <<'EOF'
@@ -71,6 +73,8 @@ cleanup() {
 
 show_menu() {
   local choice=""
+  MENU_EXIT=0
+  CORE_ARGS=()
   while true; do
     clear 2>/dev/null || true
     printf '%s\n' \
@@ -87,14 +91,14 @@ show_menu() {
       '============================================================' \
       ''
     printf '请选择 [0-5]: '
-    IFS= read -r choice || exit 1
+    IFS= read -r choice || { MENU_EXIT=1; return 0; }
     case "$choice" in
-      1) CORE_ARGS=(--only-domestic-latency); break ;;
-      2) CORE_ARGS=(--route -v4); break ;;
-      3) CORE_ARGS=(--route-hops -v4); break ;;
-      4) CORE_ARGS=(--only-intl); break ;;
-      5) CORE_ARGS=(--only-speedtest); break ;;
-      0) exit 0 ;;
+      1) CORE_ARGS=(--only-domestic-latency); return 0 ;;
+      2) CORE_ARGS=(--route -v4); return 0 ;;
+      3) CORE_ARGS=(--route-hops -v4); return 0 ;;
+      4) CORE_ARGS=(--only-intl); return 0 ;;
+      5) CORE_ARGS=(--only-speedtest); return 0 ;;
+      0) MENU_EXIT=1; return 0 ;;
       *) printf '\n[!] 无效选项，请重新选择。\n'; sleep 1 ;;
     esac
   done
@@ -191,55 +195,57 @@ case "$ROOTFS_DISTRO" in
 esac
 
 if [ "$FORCE_MENU" -eq 1 ] || [ "${#CORE_ARGS[@]}" -eq 0 ]; then
-  show_menu
+  INTERACTIVE_MENU=1
 fi
 
-run_core_direct() {
-  if [ -n "${TEMP_DIR:-}" ]; then
+run_selected_once() {
+  local rc=0
+  local -a rootfs_args=()
+
+  if [ "$NO_ROOTFS" -eq 1 ] || [ "${TCPQUALITY_INSIDE_ROOTFS:-0}" -eq 1 ]; then
     bash "$LOCAL_CORE" "${CORE_ARGS[@]}"
-    exit $?
+    return $?
   fi
-  exec bash "$LOCAL_CORE" "${CORE_ARGS[@]}"
+
+  if [ "$(uname -s)" != Linux ]; then
+    echo "[!] rootfs/chroot 仅支持 Linux，当前系统将直接运行 core" >&2
+    bash "$LOCAL_CORE" "${CORE_ARGS[@]}"
+    return $?
+  fi
+
+  rootfs_args+=(--distro "$ROOTFS_DISTRO")
+  [ "$KEEP_ROOTFS" -eq 1 ] && rootfs_args+=(--keep)
+  rootfs_args+=(--core "$LOCAL_CORE")
+
+  if [ "$(id -u)" -eq 0 ]; then
+    bash "$LOCAL_ROOTFS" "${rootfs_args[@]}" -- "${CORE_ARGS[@]}"
+    return $?
+  fi
+
+  if command -v sudo >/dev/null 2>&1; then
+    sudo -E bash "$LOCAL_ROOTFS" "${rootfs_args[@]}" -- "${CORE_ARGS[@]}"
+    return $?
+  fi
+
+  echo "[X] 默认 rootfs 模式需要 root 权限；请使用 root 运行，或加 --no-rootfs 直接运行宿主模式" >&2
+  return 1
 }
 
-if [ "$NO_ROOTFS" -eq 1 ] || [ "${TCPQUALITY_INSIDE_ROOTFS:-0}" -eq 1 ]; then
-  run_core_direct
-fi
+if [ "$INTERACTIVE_MENU" -eq 1 ]; then
+  while true; do
+    show_menu
+    [ "$MENU_EXIT" -eq 1 ] && exit 0
 
-if [ "$(uname -s)" != Linux ]; then
-  echo "[!] rootfs/chroot 仅支持 Linux，当前系统将直接运行 core" >&2
-  run_core_direct
-fi
-
-if [ "$(id -u)" -ne 0 ]; then
-  if command -v sudo >/dev/null 2>&1; then
-    if [ -z "${TEMP_DIR:-}" ]; then
-      TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/tcpquality-entry.XXXXXX")
+    run_rc=0
+    run_selected_once || run_rc=$?
+    echo
+    if [ "$run_rc" -ne 0 ]; then
+      echo "[!] 本次测试返回状态: $run_rc"
     fi
-    temp_entry="$TEMP_DIR/runTcpQuality.sh"
-    cat "$0" > "$temp_entry"
-    cp "$LOCAL_CORE" "$TEMP_DIR/runTcpQuality-core.sh"
-    cp "$LOCAL_ROOTFS" "$TEMP_DIR/runTcpQuality-rootfs.sh"
-    chmod 0755 "$temp_entry" "$TEMP_DIR/runTcpQuality-core.sh" "$TEMP_DIR/runTcpQuality-rootfs.sh"
-    sudo -E bash -c '
-      dir=$1
-      script=$2
-      shift 2
-      trap "rm -rf -- \"$dir\"" EXIT
-      bash "$script" "$@"
-    ' bash "$TEMP_DIR" "$temp_entry" "${ORIGINAL_ARGS[@]}"
-    exit $?
-  fi
-  echo "[X] 默认 rootfs 模式需要 root 权限；请使用 root 运行，或加 --no-rootfs 直接运行宿主模式" >&2
-  exit 1
+    printf '按回车返回主菜单...'
+    IFS= read -r _ || exit "$run_rc"
+  done
 fi
 
-ROOTFS_EXTRA_ARGS+=(--distro "$ROOTFS_DISTRO")
-[ "$KEEP_ROOTFS" -eq 1 ] && ROOTFS_EXTRA_ARGS+=(--keep)
-
-ROOTFS_EXTRA_ARGS+=(--core "$LOCAL_CORE")
-if [ -n "${TEMP_DIR:-}" ]; then
-  bash "$LOCAL_ROOTFS" "${ROOTFS_EXTRA_ARGS[@]}" -- "${CORE_ARGS[@]}"
-  exit $?
-fi
-exec bash "$LOCAL_ROOTFS" "${ROOTFS_EXTRA_ARGS[@]}" -- "${CORE_ARGS[@]}"
+run_selected_once
+exit $?
