@@ -5,7 +5,7 @@
 
 set -e
 
-TCPQUALITY_BUILD_ID="threecity-menu-v10"
+TCPQUALITY_BUILD_ID="threecity-menu-v11"
 
 # ===================== NixOS 临时运行环境 =====================
 is_nixos() {
@@ -664,7 +664,7 @@ TcpQuality 三城市三网精简版（北京 / 上海 / 广州；保留国际互
                      仅测北京/上海/广州三网 TCP 丢包与延迟，不跑 traceroute
   --only-intl       仅测国际网站/CDN 与国际 iPerf3 互联
   --route           三城市三网线路类型识别（每城市每网 1 节点，输出 163 / 4837 / CMI 等）
-  --route-hops      三城市三网逐跳回程（固定 BestTrace 常用 9 目标；NextTrace + LeoMoeAPI + ICMP；简短中文位置 / 绿色延迟）
+  --route-hops      三城市三网逐跳回程（固定 9 目标；与常用脚本一致执行 nexttrace -M）
   --route-protocol PROTO
                      traceroute 协议: tcp、udp、both，默认 tcp
   --speedtest       在默认测试后追加北京/上海/广州三网单线程测速
@@ -2513,22 +2513,41 @@ format_route_rtt() {
   printf '%b' "$out"
 }
 
-# 菜单 3 参考 autoBestTrace / BestTrace 的固定三城三网目标。
-# 使用固定目标而不是 getNodes 动态节点，便于不同时间、不同 VPS 之间横向比较。
+# 菜单 3 与用户指定的常用 NextTrace 三网脚本保持一致。
+# 仅保留北京 / 上海 / 深圳三网 9 个目标，不加入成都教育网。
 BESTTRACE_ROUTE_TARGETS_V4=(
-  "北京|电信|219.141.140.10"
-  "北京|联通|202.106.195.68"
-  "北京|移动|221.179.155.161"
+  "北京|电信|219.141.147.210"
   "上海|电信|202.96.209.133"
-  "上海|联通|210.22.97.1"
-  "上海|移动|211.136.112.200"
   "广东|电信|58.60.188.222"
+  "北京|联通|202.106.50.1"
+  "上海|联通|210.22.97.1"
   "广东|联通|210.21.196.6"
+  "北京|移动|221.179.155.161"
+  "上海|移动|211.136.112.200"
   "广东|移动|120.196.165.24"
 )
 
 nexttrace_binary() {
-  command -v nexttrace-tiny 2>/dev/null || command -v nexttrace 2>/dev/null || true
+  command -v nexttrace 2>/dev/null || command -v nexttrace-tiny 2>/dev/null || true
+}
+
+ensure_route_hops_nexttrace() {
+  local bin
+  bin=$(nexttrace_binary)
+  [ -n "$bin" ] && return 0
+
+  # 与参考脚本一致：缺少 NextTrace 时使用官方一键安装脚本。
+  if [ "$(uname -s)" = "Linux" ] && command -v curl >/dev/null 2>&1 && command -v bash >/dev/null 2>&1; then
+    echo -e "${YELLOW}[i] 未检测到 NextTrace，正在使用 nxtrace.org/nt 安装...${NC}"
+    if [ "$(id -u)" -eq 0 ]; then
+      curl -fsSL https://nxtrace.org/nt | bash || true
+    elif command -v sudo >/dev/null 2>&1; then
+      curl -fsSL https://nxtrace.org/nt | sudo bash || true
+    fi
+  fi
+
+  bin=$(nexttrace_binary)
+  [ -n "$bin" ]
 }
 
 nexttrace_supports_raw() {
@@ -2681,14 +2700,14 @@ render_icmp_traceroute_fallback() {
 }
 
 run_detailed_route_mode() {
-  local family="$1" entry prov isp target_ip city trace_dir trace_file total=0 idx=0 rc
+  local family="$1" entry prov isp target_ip city total=0 idx=0 bin rc trace_file
   local -a selected_targets=()
 
   if [ "$family" != "4" ]; then
-    echo -e "${YELLOW}[!] BestTrace 参考模式当前只提供 IPv4 固定目标，跳过 IPv${family}${NC}"
+    echo -e "${YELLOW}[!] 固定三网逐跳回程仅测试 IPv4，跳过 IPv${family}${NC}"
     return 0
   fi
-  ipv4_available || { echo -e "${YELLOW}[!] 未检测到 IPv4，跳过三城市三网 IPv4 逐跳回程${NC}"; return 0; }
+  ipv4_available || { echo -e "${YELLOW}[!] 未检测到 IPv4，跳过三网 IPv4 逐跳回程${NC}"; return 0; }
 
   for entry in "${BESTTRACE_ROUTE_TARGETS_V4[@]}"; do
     IFS='|' read -r prov isp target_ip <<< "$entry"
@@ -2696,40 +2715,45 @@ run_detailed_route_mode() {
     selected_targets+=("$entry")
   done
   total=${#selected_targets[@]}
-  [ "$total" -gt 0 ] || { echo -e "${RED}[X] 没有可执行的三城市三网固定回程目标${NC}"; return 1; }
+  [ "$total" -gt 0 ] || { echo -e "${RED}[X] 没有可执行的三网固定回程目标${NC}"; return 1; }
 
   echo -e "${BOLD}${CYAN}  IPv4 三网逐跳回程路由${NC}"
-  echo -e "${DIM}  范围: 北京 / 上海 / 广州；电信/联通/移动各 3 个固定目标，共 9 条${NC}"
-  echo -e "${DIM}  参考 autoBestTrace：NextTrace + LeoMoeAPI + ICMP，3 次探测/跳，30 hops，28-byte packet${NC}"
-  echo -e "${DIM}  固定目标用于长期横向比较；菜单 3 不再使用 getNodes 动态回程节点。${NC}"
+  echo -e "${DIM}  与参考脚本一致：北京 / 上海 / 深圳，电信 / 联通 / 移动，共 9 条；执行 nexttrace -M 目标IP。${NC}"
+  echo -e "${DIM}  -M 关闭 Trace Map；NextTrace 默认使用 ICMP。${NC}"
   echo
 
-  trace_dir=$(mktemp -d)
+  if ! ensure_route_hops_nexttrace; then
+    echo -e "${YELLOW}[!] NextTrace 安装/获取失败，将回退系统 ICMP traceroute。${NC}"
+  fi
+  bin=$(nexttrace_binary)
+
   for entry in "${selected_targets[@]}"; do
     IFS='|' read -r prov isp target_ip <<< "$entry"
-    city=$(city_display_name "$prov")
+    if [ "$prov" = "广东" ]; then
+      city="深圳"
+    else
+      city=$(city_display_name "$prov")
+    fi
     idx=$((idx + 1))
-    trace_file=$(printf '%s/trace_%02d.txt' "$trace_dir" "$idx")
-    echo -e "${BOLD}${CYAN}  ${city}${isp} IPv4${NC}  ${DIM}-> ${target_ip}${NC}"
-    printf '  %-3s %-15s %-9s %-10s %-8s %s\n' '跳' 'IP' 'ASN' '位置' '运营商' 'RTT'
+    printf '%-70s\n' '-' | sed 's/ /-/g'
+    echo -e "${BOLD}${CYAN}${city}${isp}${NC}  ${DIM}${target_ip}${NC}"
 
     rc=0
-    run_besttrace_probe_one "$target_ip" "$trace_file" || rc=$?
-    if [ "$rc" -eq 0 ]; then
-      if ! render_nexttrace_raw_compact "$trace_file" "$target_ip" "$city" "$isp"; then
-        echo -e "${YELLOW}  [!] NextTrace 未返回可解析逐跳结果，改用 ICMP traceroute 回退显示。${NC}"
-        run_icmp_traceroute_fallback_probe "$target_ip" "$trace_file"
-        render_icmp_traceroute_fallback "$trace_file" "$target_ip" "$city" "$isp"
+    if [ -n "$bin" ]; then
+      if command -v timeout >/dev/null 2>&1; then
+        timeout 90 "$bin" -M "$target_ip" || rc=$?
+      else
+        "$bin" -M "$target_ip" || rc=$?
       fi
-    elif [ "$rc" -eq 2 ]; then
-      echo -e "${YELLOW}  [!] 当前 nexttrace 不支持 raw，已回退系统 ICMP traceroute；位置/ASN 信息会减少。${NC}"
-      render_icmp_traceroute_fallback "$trace_file" "$target_ip" "$city" "$isp"
+      [ "$rc" -eq 0 ] || echo -e "${YELLOW}[!] ${city}${isp} NextTrace 返回状态 ${rc}${NC}"
     else
-      echo -e "${RED}  [X] 无可用 ICMP 路由工具${NC}"
+      trace_file=$(mktemp)
+      run_icmp_traceroute_fallback_probe "$target_ip" "$trace_file"
+      cat "$trace_file"
+      rm -f -- "$trace_file"
     fi
-    echo
   done
-  rm -rf "$trace_dir"
+  printf '%-70s\n' '-' | sed 's/ /-/g'
 }
 
 collect_route_labels() {

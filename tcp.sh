@@ -11,14 +11,14 @@
 
 set -Eeuo pipefail
 
-TCPQUALITY_BUILD_ID="threecity-menu-v10"
+TCPQUALITY_BUILD_ID="threecity-menu-v11"
 
-RAW_BASE="${TCPQUALITY_RAW_BASE:-https://raw.githubusercontent.com/ibsgss/TcpQuality/main}"
+RAW_BASE="${TCPQUALITY_RAW_BASE:-https://raw.githubusercontent.com/byilrq/TcpQuality/main}"
 case "$RAW_BASE" in
   http://*|https://*) ;;
   *)
     echo "[!] TCPQUALITY_RAW_BASE 非法，已回退到官方 GitHub 源" >&2
-    RAW_BASE="https://raw.githubusercontent.com/ibsgss/TcpQuality/main"
+    RAW_BASE="https://raw.githubusercontent.com/byilrq/TcpQuality/main"
     ;;
 esac
 RAW_BASE="${RAW_BASE%/}"
@@ -100,24 +100,46 @@ show_menu() {
   done
 }
 
-verify_local_bundle() {
-  local f marker="TCPQUALITY_BUILD_ID=\"${TCPQUALITY_BUILD_ID}\""
-  for f in "$LOCAL_CORE" "$LOCAL_ROOTFS"; do
-    if [ ! -f "$f" ]; then
-      echo "[X] 缺少同版本文件: $f" >&2
-      echo "[i] 请完整解压压缩包后，在同一目录运行 runTcpQuality.sh；不要只替换入口脚本。" >&2
-      exit 1
-    fi
-    if ! grep -Fq "$marker" "$f"; then
-      echo "[X] TcpQuality 三文件版本不一致: $(basename "$f")" >&2
-      echo "[i] 当前入口版本: $TCPQUALITY_BUILD_ID。请删除旧文件后完整解压新版压缩包。" >&2
-      exit 1
-    fi
-  done
+verify_bundle_file() {
+  local f="$1" marker="TCPQUALITY_BUILD_ID=\"${TCPQUALITY_BUILD_ID}\""
+  [ -f "$f" ] && grep -Fq "$marker" "$f"
 }
 
-verify_local_bundle
+prepare_bundle() {
+  local core_url rootfs_url
+
+  # 完整解压运行时优先使用同目录文件；bash <(curl ...) 时 /dev/fd 下没有配套文件，
+  # 自动把同版本 core/rootfs 拉到临时目录后继续执行。
+  if verify_bundle_file "$LOCAL_CORE" && verify_bundle_file "$LOCAL_ROOTFS"; then
+    return 0
+  fi
+
+  TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/tcpquality-entry.XXXXXX")
+  LOCAL_CORE="$TEMP_DIR/runTcpQuality-core.sh"
+  LOCAL_ROOTFS="$TEMP_DIR/runTcpQuality-rootfs.sh"
+  core_url="$RAW_BASE/runTcpQuality-core.sh"
+  rootfs_url="$RAW_BASE/runTcpQuality-rootfs.sh"
+
+  echo "[i] 单文件在线运行：正在获取同版本 core/rootfs..."
+  curl -fL --retry 3 --connect-timeout 15 --max-time 120 "$core_url" -o "$LOCAL_CORE" || {
+    echo "[X] 下载失败: $core_url" >&2
+    exit 1
+  }
+  curl -fL --retry 3 --connect-timeout 15 --max-time 120 "$rootfs_url" -o "$LOCAL_ROOTFS" || {
+    echo "[X] 下载失败: $rootfs_url" >&2
+    exit 1
+  }
+  chmod 0755 "$LOCAL_CORE" "$LOCAL_ROOTFS"
+
+  if ! verify_bundle_file "$LOCAL_CORE" || ! verify_bundle_file "$LOCAL_ROOTFS"; then
+    echo "[X] 在线获取的 TcpQuality 文件版本与入口不一致。" >&2
+    echo "[i] 当前入口版本: $TCPQUALITY_BUILD_ID；请确认 GitHub 三个脚本已一起更新。" >&2
+    exit 1
+  fi
+}
+
 trap cleanup EXIT
+prepare_bundle
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -173,6 +195,10 @@ if [ "$FORCE_MENU" -eq 1 ] || [ "${#CORE_ARGS[@]}" -eq 0 ]; then
 fi
 
 run_core_direct() {
+  if [ -n "${TEMP_DIR:-}" ]; then
+    bash "$LOCAL_CORE" "${CORE_ARGS[@]}"
+    exit $?
+  fi
   exec bash "$LOCAL_CORE" "${CORE_ARGS[@]}"
 }
 
@@ -187,19 +213,22 @@ fi
 
 if [ "$(id -u)" -ne 0 ]; then
   if command -v sudo >/dev/null 2>&1; then
-    TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/tcpquality-entry.XXXXXX")
+    if [ -z "${TEMP_DIR:-}" ]; then
+      TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/tcpquality-entry.XXXXXX")
+    fi
     temp_entry="$TEMP_DIR/runTcpQuality.sh"
-    cp "$0" "$temp_entry"
+    cat "$0" > "$temp_entry"
     cp "$LOCAL_CORE" "$TEMP_DIR/runTcpQuality-core.sh"
     cp "$LOCAL_ROOTFS" "$TEMP_DIR/runTcpQuality-rootfs.sh"
     chmod 0755 "$temp_entry" "$TEMP_DIR/runTcpQuality-core.sh" "$TEMP_DIR/runTcpQuality-rootfs.sh"
-    exec sudo -E bash -c '
+    sudo -E bash -c '
       dir=$1
       script=$2
       shift 2
       trap "rm -rf -- \"$dir\"" EXIT
-      exec bash "$script" "$@"
+      bash "$script" "$@"
     ' bash "$TEMP_DIR" "$temp_entry" "${ORIGINAL_ARGS[@]}"
+    exit $?
   fi
   echo "[X] 默认 rootfs 模式需要 root 权限；请使用 root 运行，或加 --no-rootfs 直接运行宿主模式" >&2
   exit 1
@@ -209,4 +238,8 @@ ROOTFS_EXTRA_ARGS+=(--distro "$ROOTFS_DISTRO")
 [ "$KEEP_ROOTFS" -eq 1 ] && ROOTFS_EXTRA_ARGS+=(--keep)
 
 ROOTFS_EXTRA_ARGS+=(--core "$LOCAL_CORE")
+if [ -n "${TEMP_DIR:-}" ]; then
+  bash "$LOCAL_ROOTFS" "${ROOTFS_EXTRA_ARGS[@]}" -- "${CORE_ARGS[@]}"
+  exit $?
+fi
 exec bash "$LOCAL_ROOTFS" "${ROOTFS_EXTRA_ARGS[@]}" -- "${CORE_ARGS[@]}"

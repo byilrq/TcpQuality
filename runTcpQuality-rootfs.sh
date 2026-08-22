@@ -4,7 +4,7 @@
 # remain representative of the VPS. This wrapper never uses proot.
 set -Eeuo pipefail
 
-TCPQUALITY_BUILD_ID="threecity-menu-v10"
+TCPQUALITY_BUILD_ID="threecity-menu-v11"
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 SELF_SCRIPT="$SCRIPT_DIR/runTcpQuality-rootfs.sh"
@@ -317,7 +317,7 @@ download_nexttrace_guest() {
     armv6l|armv6) asset_arch=armv6 ;;
     *) return 1 ;;
   esac
-  asset_name="nexttrace-tiny_linux_${asset_arch}"
+  asset_name="nexttrace_linux_${asset_arch}"
   api_json=$(curl -fsSL --retry 3 --connect-timeout 15 --max-time 60 "$NEXTTRACE_RELEASE_API" 2>/dev/null || true)
   if [ -n "$api_json" ]; then
     asset_meta=$(printf '%s\n' "$api_json" | awk -v name="$asset_name" '
@@ -348,10 +348,10 @@ download_nexttrace_guest() {
   if [ -n "${digest:-}" ]; then
     verify_sha256 "$digest" "$binary" || return 1
   fi
-  cp "$binary" "$ROOTFS_DIR/usr/local/bin/nexttrace-tiny"
-  chmod 0755 "$ROOTFS_DIR/usr/local/bin/nexttrace-tiny"
+  cp "$binary" "$ROOTFS_DIR/usr/local/bin/nexttrace"
+  chmod 0755 "$ROOTFS_DIR/usr/local/bin/nexttrace"
   rm -f -- "$binary"
-  env -i HOME=/root "PATH=$GUEST_PATH" TERM=dumb chroot "$ROOTFS_DIR" /usr/local/bin/nexttrace-tiny -V >/dev/null 2>&1
+  env -i HOME=/root "PATH=$GUEST_PATH" TERM=dumb chroot "$ROOTFS_DIR" /usr/local/bin/nexttrace -V >/dev/null 2>&1
 }
 
 download_extract() {
@@ -830,26 +830,26 @@ prepare_guest_files() {
   done
   [ "$need_nexttrace" -eq 1 ] || return 0
 
-  if [ -x "$ROOTFS_DIR/usr/local/bin/nexttrace-tiny" ] &&
-     env -i HOME=/root "PATH=$GUEST_PATH" TERM=dumb chroot "$ROOTFS_DIR" /usr/local/bin/nexttrace-tiny -V >/dev/null 2>&1; then
-    echo "[√] 逐跳回程 NextTrace/LeoMoeAPI 工具已就绪"
+  if [ -x "$ROOTFS_DIR/usr/local/bin/nexttrace" ] &&
+     env -i HOME=/root "PATH=$GUEST_PATH" TERM=dumb chroot "$ROOTFS_DIR" /usr/local/bin/nexttrace -V >/dev/null 2>&1; then
+    echo "[√] 逐跳回程 NextTrace 已就绪"
     return 0
   fi
   if download_nexttrace_guest; then
-    echo "[√] nexttrace-tiny 已安装到临时 rootfs"
+    echo "[√] nexttrace 完整版已安装到临时 rootfs"
     return 0
   fi
-  nexttrace_path=$(command -v nexttrace-tiny 2>/dev/null || command -v nexttrace 2>/dev/null || true)
+  nexttrace_path=$(command -v nexttrace 2>/dev/null || command -v nexttrace-tiny 2>/dev/null || true)
   if [ -n "$nexttrace_path" ] && [ -f "$nexttrace_path" ]; then
-    cp -L "$nexttrace_path" "$ROOTFS_DIR/usr/local/bin/nexttrace-tiny"
-    chmod 0755 "$ROOTFS_DIR/usr/local/bin/nexttrace-tiny"
-    if env -i HOME=/root "PATH=$GUEST_PATH" TERM=dumb chroot "$ROOTFS_DIR" /usr/local/bin/nexttrace-tiny -V >/dev/null 2>&1; then
-      echo "[√] 已复用宿主 nexttrace"
+    cp -L "$nexttrace_path" "$ROOTFS_DIR/usr/local/bin/nexttrace"
+    chmod 0755 "$ROOTFS_DIR/usr/local/bin/nexttrace"
+    if env -i HOME=/root "PATH=$GUEST_PATH" TERM=dumb chroot "$ROOTFS_DIR" /usr/local/bin/nexttrace -V >/dev/null 2>&1; then
+      echo "[√] 已复用宿主 NextTrace"
       return 0
     fi
-    rm -f -- "$ROOTFS_DIR/usr/local/bin/nexttrace-tiny"
+    rm -f -- "$ROOTFS_DIR/usr/local/bin/nexttrace"
   fi
-  echo "[!] nexttrace-tiny 不可用；菜单 3 将回退 ICMP traceroute，仍显示每跳延迟，但地理位置/ASN 会减少" >&2
+  echo "[!] NextTrace 不可用；菜单 3 将回退 ICMP traceroute。" >&2
 }
 
 mkdir -p "$OUTPUT_DIR" || die "无法创建输出目录: $OUTPUT_DIR"
