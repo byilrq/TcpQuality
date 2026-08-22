@@ -5,7 +5,7 @@
 
 set -e
 
-TCPQUALITY_BUILD_ID="threecity-menu-v12"
+TCPQUALITY_BUILD_ID="threecity-menu-v13"
 
 # ===================== NixOS 临时运行环境 =====================
 is_nixos() {
@@ -286,6 +286,7 @@ ONLY_IPV6=0
 ONLY_LARGE=0
 ROUTE_MODE=0
 ROUTE_HOPS_MODE=0
+UDP_QUALITY_MODE=0
 ROUTE_PROTOCOL="tcp"
 ROUTE_ACTIVE_PREFIX=""
 DOMESTIC_ROUTE_ENABLED=1
@@ -665,6 +666,7 @@ TcpQuality 三城市三网精简版（北京 / 上海 / 广州；保留国际互
   --only-intl       仅测国际网站/CDN 与国际 iPerf3 互联
   --route           三城市三网线路类型识别（每城市每网 1 节点，输出 163 / 4837 / CMI 等）
   --route-hops      三城市三网逐跳回程（固定 9 目标；与常用脚本一致执行 nexttrace -M）
+  --udp-quality     三城市三网 UDP 质量测试（平均延迟 / 丢包 / 抖动 + UDP 逐跳回程）
   --route-protocol PROTO
                      traceroute 协议: tcp、udp、both，默认 tcp
   --speedtest       在默认测试后追加北京/上海/广州三网单线程测速
@@ -719,6 +721,7 @@ parse_args() {
       --only-intl) INTERNATIONAL_ENABLED=1; INTERNATIONAL_ONLY=1; shift ;;
       --route) ROUTE_MODE=1; shift ;;
       --route-hops) ROUTE_HOPS_MODE=1; DOMESTIC_NODE_LIMIT=1; INTERNATIONAL_ENABLED=0; shift ;;
+      --udp-quality) UDP_QUALITY_MODE=1; ONLY_IPV4=1; DOMESTIC_NODE_LIMIT=1; INTERNATIONAL_ENABLED=0; shift ;;
       --route-protocol)
         if [ -z "${2:-}" ] || { [ "$2" != "tcp" ] && [ "$2" != "udp" ] && [ "$2" != "both" ]; }; then
           echo -e "${RED}[X] --route-protocol 只支持 tcp、udp、both${NC}" >&2
@@ -2748,6 +2751,133 @@ run_detailed_route_mode() {
       cat "$trace_file"
       rm -f -- "$trace_file"
     fi
+  done
+  printf '%-70s\n' '-' | sed 's/ /-/g'
+}
+
+
+nexttrace_supports_udp_mtr() {
+  local bin="$1" help
+  [ -n "$bin" ] || return 1
+  help=$("$bin" -h 2>&1 || true)
+  printf '%s\n' "$help" | grep -q -- '--udp' || return 1
+  printf '%s\n' "$help" | grep -q -- '--mtr' || return 1
+  printf '%s\n' "$help" | grep -q -- '--report' || return 1
+  return 0
+}
+
+run_udp_mtr_probe_one() {
+  local bin="$1" target_ip="$2" out_file="$3" rc=0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 75 "$bin" -4 -r -U -n -C -q 10 -i 300 --timeout 1200 -m 30 -p 33494 -M "$target_ip" > "$out_file" 2>&1 || rc=$?
+  else
+    "$bin" -4 -r -U -n -C -q 10 -i 300 --timeout 1200 -m 30 -p 33494 -M "$target_ip" > "$out_file" 2>&1 || rc=$?
+  fi
+  return "$rc"
+}
+
+parse_udp_mtr_final_stats() {
+  local target_ip="$1" out_file="$2"
+  awk -v ip="$target_ip" '
+    $2 == ip && $3 ~ /%$/ && $4 ~ /^[0-9]+$/ {
+      loss=$3; gsub(/%/, "", loss)
+      avg=$6; stdev=$9
+      if (avg ~ /^[0-9.]+$/ && stdev ~ /^[0-9.]+$/) {
+        print loss "|" avg "|" stdev
+        found=1
+      }
+    }
+    END { if (!found) print "N/A|N/A|N/A" }
+  ' "$out_file" | tail -n 1
+}
+
+run_udp_route_one() {
+  local bin="$1" target_ip="$2" rc=0
+  if [ -n "$bin" ]; then
+    if command -v timeout >/dev/null 2>&1; then
+      timeout 60 "$bin" -4 -U -M -q 3 -m 30 --timeout 1500 -p 33494 "$target_ip" || rc=$?
+    else
+      "$bin" -4 -U -M -q 3 -m 30 --timeout 1500 -p 33494 "$target_ip" || rc=$?
+    fi
+    return "$rc"
+  fi
+
+  check_traceroute
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 60 traceroute -4 -n -q 3 -w 2 -m 30 -p 33494 "$target_ip" || rc=$?
+  else
+    traceroute -4 -n -q 3 -w 2 -m 30 -p 33494 "$target_ip" || rc=$?
+  fi
+  return "$rc"
+}
+
+run_udp_quality_mode() {
+  local entry prov isp target_ip city idx=0 total=0 bin stats loss avg jitter rc out_file
+  local -a selected_targets=()
+
+  ipv4_available || { echo -e "${YELLOW}[!] 未检测到 IPv4，跳过 UDP 三网质量测试${NC}"; return 0; }
+
+  for entry in "${BESTTRACE_ROUTE_TARGETS_V4[@]}"; do
+    IFS='|' read -r prov isp target_ip <<< "$entry"
+    province_selected "$prov" || continue
+    selected_targets+=("$entry")
+  done
+  total=${#selected_targets[@]}
+  [ "$total" -gt 0 ] || { echo -e "${RED}[X] 没有可执行的 UDP 测试目标${NC}"; return 1; }
+
+  echo -e "${BOLD}${CYAN}  IPv4 三网 UDP 质量测试${NC}"
+  echo -e "${DIM}  每个目标使用 UDP/33494 运行 10 次 MTR；抖动使用 RTT StDev（标准差）表示。${NC}"
+  echo -e "${DIM}  目标不回应 UDP/ICMP 时会显示 N/A，不会把中间路由数据当成终点。${NC}"
+  echo
+
+  if ! ensure_route_hops_nexttrace; then
+    echo -e "${YELLOW}[!] NextTrace 安装/获取失败，UDP 汇总会显示 N/A，并回退到系统 traceroute。${NC}"
+  fi
+  bin=$(nexttrace_binary)
+
+  printf '  %-16s %-14s %-14s %-16s\n' "节点" "平均延迟" "UDP丢包" "抖动(StDev)"
+  printf '  %-16s %-14s %-14s %-16s\n' '----------------' '--------------' '--------------' '----------------'
+
+  for entry in "${selected_targets[@]}"; do
+    IFS='|' read -r prov isp target_ip <<< "$entry"
+    city=$(city_display_name "$prov")
+    idx=$((idx + 1))
+    loss='N/A'; avg='N/A'; jitter='N/A'
+    if [ -n "$bin" ] && nexttrace_supports_udp_mtr "$bin"; then
+      printf '\r  UDP MTR %d/%d: %s %s                    ' "$idx" "$total" "${city}${isp}" "$target_ip" >&2
+      out_file="$RESULT_DIR/udp_mtr_${idx}.txt"
+      rc=0
+      run_udp_mtr_probe_one "$bin" "$target_ip" "$out_file" || rc=$?
+      stats=$(parse_udp_mtr_final_stats "$target_ip" "$out_file")
+      IFS='|' read -r loss avg jitter <<< "$stats"
+      [ "$avg" = 'N/A' ] || avg="${avg}ms"
+      [ "$loss" = 'N/A' ] || loss="${loss}%"
+      [ "$jitter" = 'N/A' ] || jitter="${jitter}ms"
+    fi
+    printf '\r\033[2K' >&2
+    printf '  %-16s %-14s %-14s %-16s\n' "${city}${isp}" "$avg" "$loss" "$jitter"
+  done
+
+  if [ -z "$bin" ] || ! nexttrace_supports_udp_mtr "$bin"; then
+    echo
+    echo -e "${YELLOW}[!] 当前 NextTrace 版本不支持 UDP MTR report，延迟/丢包/抖动已保持 N/A。${NC}"
+  fi
+
+  echo
+  echo -e "${BOLD}${CYAN}  IPv4 三网 UDP 逐跳回程路由${NC}"
+  echo -e "${DIM}  UDP/33494，3 probes/hop，最多 30 hops。${NC}"
+  echo
+
+  idx=0
+  for entry in "${selected_targets[@]}"; do
+    IFS='|' read -r prov isp target_ip <<< "$entry"
+    city=$(city_display_name "$prov")
+    idx=$((idx + 1))
+    printf '%-70s\n' '-' | sed 's/ /-/g'
+    echo -e "${BOLD}${CYAN}${city}${isp}${NC}  ${DIM}${target_ip}${NC}  ${MAGENTA}[UDP]${NC}"
+    rc=0
+    run_udp_route_one "$bin" "$target_ip" || rc=$?
+    [ "$rc" -eq 0 ] || echo -e "${YELLOW}[!] ${city}${isp} UDP NextTrace/traceroute 返回状态 ${rc}${NC}"
   done
   printf '%-70s\n' '-' | sed 's/ /-/g'
 }
@@ -5802,6 +5932,15 @@ main() {
 
   if [ "$SPEEDTEST_ONLY" -eq 1 ]; then
     run_speedtest_mode
+    exit 0
+  fi
+
+  if [ "$UDP_QUALITY_MODE" -eq 1 ]; then
+    check_curl
+    detect_ip_stack
+    echo -e "  ${DIM}测试时间：$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S CST（北京时间）')${NC}"
+    echo
+    run_udp_quality_mode
     exit 0
   fi
 

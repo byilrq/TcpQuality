@@ -11,7 +11,7 @@
 
 set -Eeuo pipefail
 
-TCPQUALITY_BUILD_ID="threecity-menu-v12"
+TCPQUALITY_BUILD_ID="threecity-menu-v13"
 
 RAW_BASE="${TCPQUALITY_RAW_BASE:-https://raw.githubusercontent.com/byilrq/TcpQuality/main}"
 case "$RAW_BASE" in
@@ -87,10 +87,11 @@ show_menu() {
       '  3. 三网 逐跳回程测试（IPv4）' \
       '  4. 国际互联测试' \
       '  5. 三网 单线程测速' \
+      '  6. 三网 UDP 质量 / 丢包 / 抖动 / 逐跳回程' \
       '  0. 退出' \
       '============================================================' \
       ''
-    printf '请选择 [0-5]: '
+    printf '请选择 [0-6]: '
     IFS= read -r choice || { MENU_EXIT=1; return 0; }
     case "$choice" in
       1) CORE_ARGS=(--only-domestic-latency); return 0 ;;
@@ -98,6 +99,7 @@ show_menu() {
       3) CORE_ARGS=(--route-hops -v4); return 0 ;;
       4) CORE_ARGS=(--only-intl); return 0 ;;
       5) CORE_ARGS=(--only-speedtest); return 0 ;;
+      6) CORE_ARGS=(--udp-quality -v4); return 0 ;;
       0) MENU_EXIT=1; return 0 ;;
       *) printf '\n[!] 无效选项，请重新选择。\n'; sleep 1 ;;
     esac
