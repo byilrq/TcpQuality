@@ -2,8 +2,6 @@
 #
 # TcpQuality 三城市三网精简版入口（北京 / 上海 / 广州，保留国际互连与回程线路）。
 # 旧命令保持不变：
-#   bash <(curl -fsSL https://raw.githubusercontent.com/ibsgss/TcpQuality/main/runTcpQuality.sh)
-#   bash <(curl -fsSL https://tcpquality.ibsgss.uk/run)
 # fish/zsh 不支持或不稳定时可用：
 #   curl -fsSL https://tcpquality.ibsgss.uk/run | env TERM=xterm bash
 #
